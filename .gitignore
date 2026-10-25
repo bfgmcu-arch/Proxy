@@ -1,0 +1,5 @@
+
+# Cloudflare Wrangler Cache
+.wrangler/
+self_created_tools/
+wrangler.log

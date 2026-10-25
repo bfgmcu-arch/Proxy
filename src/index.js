@@ -1,5 +1,17 @@
 export default {
   async fetch(request, env, ctx) {
+    // Fast path for OPTIONS requests (CORS preflight)
+    if (request.method === 'OPTIONS') {
+      return new Response(null, {
+        headers: {
+          'Access-Control-Allow-Origin': '*',
+          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH',
+          'Access-Control-Allow-Headers': '*',
+          'Access-Control-Max-Age': '86400',
+        }
+      });
+    }
+
     const url = new URL(request.url);
     const proxyBase = url.origin;
 
@@ -32,7 +44,6 @@ export default {
                 if (!targetUrl.startsWith('http://') && !targetUrl.startsWith('https://')) {
                   targetUrl = 'https://' + targetUrl;
                 }
-                // Redirect to /<url>
                 window.location.href = '/' + targetUrl;
               });
             </script>
@@ -67,9 +78,6 @@ export default {
           let baseRefererTarget = refererUrl.pathname.substring(1);
           if (baseRefererTarget) {
             try {
-              // Try to find the original target URL that the referer points to
-              // For example, referer is https://proxy.com/https://example.com/page
-              // baseRefererTarget is https://example.com/page
               const baseTargetUrl = new URL(baseRefererTarget);
               targetUrl = new URL(targetUrlStr, baseTargetUrl.href);
             } catch (e2) {
@@ -109,7 +117,13 @@ export default {
       redirect: 'manual' // We handle redirects manually to rewrite them
     });
 
-    let response = await fetch(proxyRequest);
+    let response;
+    try {
+      response = await fetch(proxyRequest);
+    } catch (e) {
+      return new Response('Error fetching target URL: ' + e.message, { status: 502 });
+    }
+
     let responseHeaders = new Headers(response.headers);
 
     // Strip restrictive headers
@@ -128,60 +142,23 @@ export default {
           // Rewrite the location to point back to our proxy
           responseHeaders.set('location', `${proxyBase}/${redirectUrl.href}`);
         } catch (e) {
-          // If we can't parse it, leave it or remove it
+          // Ignore
         }
       }
     }
 
-    let finalResponse = new Response(response.body, {
+    // Inject base tag for HTML responses without using HTMLRewriter (using streaming)
+    // Wait, the prompt says "removes HTMLRewriter". We should remove HTMLRewriter entirely and just pass through.
+    // If we just pass through, relative links will hit our proxy and use the Referer fallback.
+    // This is super lightweight.
+
+    responseHeaders.set('Access-Control-Allow-Origin', '*');
+
+    // Return direct stream
+    return new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers: responseHeaders
     });
-
-    // Check if the response is HTML, if so, we can rewrite links
-    const contentType = responseHeaders.get('content-type') || '';
-    if (contentType.includes('text/html')) {
-      const rewriteAttribute = (element, attributeName) => {
-        const val = element.getAttribute(attributeName);
-        if (val && !val.startsWith('data:') && !val.startsWith('javascript:') && !val.startsWith('#')) {
-          try {
-            const resolvedUrl = new URL(val, targetUrl.href);
-            element.setAttribute(attributeName, `${proxyBase}/${resolvedUrl.href}`);
-          } catch (e) {
-            // Ignore invalid URLs
-          }
-        }
-      };
-
-      class AttributeRewriter {
-        element(element) {
-          if (element.tagName === 'a' || element.tagName === 'link') {
-            rewriteAttribute(element, 'href');
-          } else if (element.tagName === 'img' || element.tagName === 'script' || element.tagName === 'iframe') {
-            rewriteAttribute(element, 'src');
-          } else if (element.tagName === 'form') {
-            rewriteAttribute(element, 'action');
-          }
-        }
-      }
-
-      // Inject base tag so that relative links that weren't caught (e.g. by JS) also point to our proxy
-      class HeadRewriter {
-        element(element) {
-            // We use JS to dynamically change base for the document so it knows its "base" is the target URL.
-            // Wait, actually setting `<base href="...proxy.../target">` might break relative paths for things.
-            // The simplest approach is to rewrite links. Let's just append a base tag for the proxy+target
-            element.append(`<base href="${proxyBase}/${targetUrl.href}">`, { html: true });
-        }
-      }
-
-      finalResponse = new HTMLRewriter()
-        .on('a, link, img, script, iframe, form', new AttributeRewriter())
-        .on('head', new HeadRewriter())
-        .transform(finalResponse);
-    }
-
-    return finalResponse;
   }
 };

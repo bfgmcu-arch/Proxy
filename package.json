@@ -1,21 +1,16 @@
 {
-  "name": "app",
+  "name": "proxy",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/bfgmcu-arch/Proxy.git"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "description": "A lightweight web proxy",
+  "main": "server.js",
   "type": "module",
-  "bugs": {
-    "url": "https://github.com/bfgmcu-arch/Proxy/issues"
+  "engines": {
+    "node": ">=18.0.0"
   },
-  "homepage": "https://github.com/bfgmcu-arch/Proxy#readme"
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {},
+  "author": "",
+  "license": "ISC"
 }

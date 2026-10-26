@@ -3,3 +3,6 @@
 .wrangler/
 self_created_tools/
 wrangler.log
+
+# Node environment
+server.log

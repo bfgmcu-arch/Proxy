@@ -1,6 +1,0 @@
-name = "web-proxy"
-main = "src/index.js"
-compatibility_date = "2023-10-15"
-
-[build]
-command = ""

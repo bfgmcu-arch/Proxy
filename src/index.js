@@ -1,5 +1,14 @@
 export default {
   async fetch(request, env, ctx) {
+    // Check IP restriction if ALLOWED_IPS is configured
+    if (env.ALLOWED_IPS) {
+      const allowedIps = env.ALLOWED_IPS.split(',').map(ip => ip.trim());
+      const clientIp = request.headers.get('cf-connecting-ip');
+      if (clientIp && !allowedIps.includes(clientIp)) {
+        return new Response('403 Forbidden: Your IP is not allowed to use this proxy.', { status: 403 });
+      }
+    }
+
     // Fast path for OPTIONS requests (CORS preflight)
     if (request.method === 'OPTIONS') {
       return new Response(null, {

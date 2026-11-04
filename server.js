@@ -5,6 +5,19 @@ const PORT = process.env.PORT || 3000;
 
 const server = http.createServer(async (req, res) => {
   try {
+    // Check IP restriction if ALLOWED_IPS is configured
+    if (process.env.ALLOWED_IPS) {
+      const allowedIps = process.env.ALLOWED_IPS.split(',').map(ip => ip.trim());
+      // On Render, client IP is in x-forwarded-for. Fallback to socket remoteAddress.
+      const forwardedFor = req.headers['x-forwarded-for'];
+      const clientIp = forwardedFor ? forwardedFor.split(',')[0].trim() : req.socket.remoteAddress;
+
+      if (clientIp && !allowedIps.includes(clientIp)) {
+        res.writeHead(403);
+        return res.end('403 Forbidden: Your IP is not allowed to use this proxy.');
+      }
+    }
+
     // Fast path for OPTIONS requests (CORS preflight)
     if (req.method === 'OPTIONS') {
       res.writeHead(204, {
@@ -167,8 +180,6 @@ const server = http.createServer(async (req, res) => {
 
     // Remove chunked encoding header if present, let node http handle it
     delete responseHeaders['transfer-encoding'];
-    // Content-encoding issues can occur if we pass through compression headers but node alters the stream,
-    // however since we are streaming directly from fetch body, passing them is usually fine.
 
     res.writeHead(response.status, responseHeaders);
 

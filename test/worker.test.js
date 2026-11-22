@@ -5,6 +5,8 @@ import worker, {
   RUNTIME_PATH,
   SW_PATH,
   extractVideoId,
+  parseStartSeconds,
+  matchYouTubePageRoute,
   parseSearchVideos,
   extractPlayableStreams,
   rewriteM3u8,
@@ -22,6 +24,55 @@ test('extractVideoId parses watch, youtu.be, shorts, embed, and raw IDs', () => 
   assert.equal(extractVideoId('https://youtu.be/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
   assert.equal(extractVideoId('https://www.youtube.com/shorts/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
   assert.equal(extractVideoId('not a video'), null);
+});
+
+test('parseStartSeconds and matchYouTubePageRoute seamlessly map all YouTube URLs', async () => {
+  assert.equal(parseStartSeconds('90'), 90);
+  assert.equal(parseStartSeconds('1m30s'), 90);
+  assert.equal(parseStartSeconds('1h2m3s'), 3723);
+
+  assert.deepEqual(
+    matchYouTubePageRoute(new URL('https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1m30s')),
+    { type: 'watch', videoId: 'dQw4w9WgXcQ', startSeconds: 90 }
+  );
+  assert.deepEqual(
+    matchYouTubePageRoute(new URL('https://youtu.be/dQw4w9WgXcQ?t=42')),
+    { type: 'watch', videoId: 'dQw4w9WgXcQ', startSeconds: 42 }
+  );
+  assert.deepEqual(
+    matchYouTubePageRoute(new URL('https://www.youtube.com/embed/dQw4w9WgXcQ')),
+    { type: 'embed', videoId: 'dQw4w9WgXcQ', startSeconds: 0 }
+  );
+  assert.deepEqual(
+    matchYouTubePageRoute(new URL('https://www.youtube.com/results?search_query=chess')),
+    { type: 'search', query: 'chess' }
+  );
+  assert.deepEqual(
+    matchYouTubePageRoute(new URL('https://www.youtube.com/')),
+    { type: 'home' }
+  );
+  // API endpoints and ?raw=1 must NOT be intercepted
+  assert.equal(matchYouTubePageRoute(new URL('https://www.youtube.com/youtubei/v1/player')), null);
+  assert.equal(matchYouTubePageRoute(new URL('https://www.youtube.com/watch?v=dQw4w9WgXcQ&raw=1')), null);
+
+  // Worker seamlessly serves watch & embed for proxied YouTube URLs
+  const wResp = await worker.fetch(
+    new Request('https://my.workers.dev/-----https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=30'),
+    {},
+    {}
+  );
+  assert.equal(wResp.status, 200);
+  const wHtml = await wResp.text();
+  assert.match(wHtml, /dQw4w9WgXcQ/);
+  assert.match(wHtml, /initStart = 30/);
+
+  const embResp = await worker.fetch(
+    new Request('https://my.workers.dev/-----https://www.youtube.com/embed/dQw4w9WgXcQ'),
+    {},
+    {}
+  );
+  assert.equal(embResp.status, 200);
+  assert.match(await embResp.text(), /YouTube Embed/);
 });
 
 test('parseSearchVideos extracts videoRenderer items from InnerTube JSON', () => {

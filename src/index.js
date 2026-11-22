@@ -295,6 +295,77 @@ export function extractVideoId(input) {
   return null;
 }
 
+export function parseStartSeconds(t) {
+  if (!t) return 0;
+  const s = String(t).trim().toLowerCase();
+  if (/^\d+$/.test(s)) return Number(s);
+  let total = 0;
+  const h = s.match(/(\d+)h/);
+  const m = s.match(/(\d+)m/);
+  const sec = s.match(/(\d+)s/);
+  if (h) total += Number(h[1]) * 3600;
+  if (m) total += Number(m[1]) * 60;
+  if (sec) total += Number(sec[1]);
+  return total;
+}
+
+/**
+ * Seamlessly detect YouTube page navigations (home, watch, shorts, search, embed)
+ * so any YouTube link from any website opens directly in the working player.
+ * Returns null for API/asset endpoints or when ?raw=1 is explicitly requested.
+ */
+export function matchYouTubePageRoute(targetUrl) {
+  if (!targetUrl) return null;
+  if (targetUrl.searchParams.get('raw') === '1') return null;
+
+  const h = targetUrl.hostname.toLowerCase();
+  const isYtHost =
+    h === 'youtube.com' ||
+    h === 'www.youtube.com' ||
+    h === 'm.youtube.com' ||
+    h === 'youtube-nocookie.com' ||
+    h === 'www.youtube-nocookie.com' ||
+    h === 'youtu.be';
+
+  if (!isYtHost) return null;
+
+  const p = targetUrl.pathname;
+  const startSeconds = parseStartSeconds(
+    targetUrl.searchParams.get('t') || targetUrl.searchParams.get('start')
+  );
+
+  if (h === 'youtu.be') {
+    const id = extractVideoId(p.split('/').filter(Boolean)[0]);
+    return id ? { type: 'watch', videoId: id, startSeconds } : { type: 'home' };
+  }
+
+  const parts = p.split('/').filter(Boolean);
+  if (parts[0] === 'embed' && parts[1]) {
+    const id = extractVideoId(parts[1]);
+    if (id) return { type: 'embed', videoId: id, startSeconds };
+  }
+
+  if (p === '/watch') {
+    const id = extractVideoId(targetUrl.searchParams.get('v'));
+    if (id) return { type: 'watch', videoId: id, startSeconds };
+  }
+
+  if ((parts[0] === 'shorts' || parts[0] === 'live') && parts[1]) {
+    const id = extractVideoId(parts[1]);
+    if (id) return { type: 'watch', videoId: id, startSeconds };
+  }
+
+  if (p === '/results') {
+    return { type: 'search', query: targetUrl.searchParams.get('search_query') || '' };
+  }
+
+  if (p === '/' || p === '' || p.startsWith('/feed/')) {
+    return { type: 'home' };
+  }
+
+  return null;
+}
+
 function ytText(obj) {
   if (!obj) return '';
   if (typeof obj.simpleText === 'string') return obj.simpleText;
@@ -698,9 +769,45 @@ function escapeHtml(str) {
     .replace(/"/g, '&quot;');
 }
 
-function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
+function renderYouTubeEmbed(videoId, startSeconds = 0) {
+  const safeV = JSON.stringify(videoId);
+  const safeStart = Number(startSeconds) || 0;
+  return new Response(
+    `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Embed</title>
+  <style>html,body{margin:0;padding:0;width:100%;height:100%;background:#000;overflow:hidden;font-family:system-ui,sans-serif;color:#fff;display:grid;place-items:center;}video{width:100%;height:100%;display:block;}</style>
+</head>
+<body>
+  <div id="msg">Loading video…</div>
+  <script>
+    (async function(){
+      try {
+        var r = await fetch('/yt/api/player?v=' + encodeURIComponent(${safeV}));
+        var p = await r.json();
+        var src = (p.muxed && p.muxed[0] && p.muxed[0].url) || p.hlsUrl;
+        if (!src) throw new Error(p.reason || 'No playable stream');
+        document.body.innerHTML = '<video controls autoplay playsinline src="' + src.replace(/"/g,'&quot;') + '"></video>';
+        var v = document.querySelector('video');
+        if (${safeStart} > 0) v.addEventListener('loadedmetadata', function(){ v.currentTime = ${safeStart}; }, { once: true });
+      } catch (e) {
+        document.getElementById('msg').textContent = 'Video unavailable: ' + e.message;
+      }
+    })();
+  </script>
+</body>
+</html>`,
+    { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } }
+  );
+}
+
+function renderYouTubeShell(proxyBase, initialQuery, initialVideoId, startSeconds = 0) {
   const safeQ = escapeHtml(initialQuery || '');
   const safeV = escapeHtml(initialVideoId || '');
+  const safeStart = Number(startSeconds) || 0;
   return new Response(
     `<!DOCTYPE html>
 <html lang="en">
@@ -777,7 +884,7 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
           return;
         }
         app.innerHTML = '<div class="grid">' + videos.map(function (v) {
-          return '<a class="card" href="/yt/watch?v=' + encodeURIComponent(v.id) + '">' +
+          return '<a class="card" href="/watch?v=' + encodeURIComponent(v.id) + '">' +
             '<div class="thumb-wrap"><img loading="lazy" src="' + thumbUrl(v.id) + '" alt="">' +
             (v.length ? '<span class="dur">' + esc(v.length) + '</span>' : '') + '</div>' +
             '<div class="meta"><div class="title">' + esc(v.title) + '</div>' +
@@ -796,7 +903,7 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
         }
       }
 
-      async function loadWatch(videoId) {
+      async function loadWatch(videoId, startSec) {
         app.innerHTML = '<div class="status">Resolving video streams via Cloudflare Worker…</div>';
         try {
           const [playerResp, relResp] = await Promise.all([
@@ -805,6 +912,7 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
           ]);
           const p = await playerResp.json();
           const rel = await relResp.json();
+          if (p.title) document.title = p.title + ' — YouTube';
 
           const streams = [];
           (p.muxed || []).forEach(function (m) {
@@ -821,7 +929,7 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
           if (streams.length > 0) {
             playerHtml = '<video id="vid" controls autoplay playsinline src="' + esc(streams[0].url) + '"></video>';
           } else {
-            playerHtml = '<iframe src="' + PREFIX + 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(videoId) + '?autoplay=1" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+            playerHtml = '<iframe src="' + PREFIX + 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(videoId) + '?autoplay=1&raw=1" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
           }
 
           const optionsHtml = streams.map(function (s, i) {
@@ -829,7 +937,7 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
           }).join('');
 
           const relHtml = (rel.videos || []).map(function (v) {
-            return '<a class="rel-card" href="/yt/watch?v=' + encodeURIComponent(v.id) + '">' +
+            return '<a class="rel-card" href="/watch?v=' + encodeURIComponent(v.id) + '">' +
               '<div class="thumb-wrap"><img loading="lazy" src="' + thumbUrl(v.id) + '" alt="">' +
               (v.length ? '<span class="dur">' + esc(v.length) + '</span>' : '') + '</div>' +
               '<div><div class="title">' + esc(v.title) + '</div><div class="sub">' + esc(v.author) + (v.views ? ' • ' + esc(v.views) : '') + '</div></div></a>';
@@ -841,14 +949,18 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
             '<div class="watch-bar">' +
               (streams.length ? '<select id="q-sel">' + optionsHtml + '</select>' : '<span class="sub">Using YouTube Embed Player</span>') +
               '<div style="display:flex;gap:.4rem;flex-wrap:wrap;">' +
-                '<button class="nav-btn" id="embed-btn">Embed Player</button>' +
-                '<a class="nav-btn" href="/__proxy_go?url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + videoId) + '">Raw YouTube</a>' +
+                '<a class="nav-btn" href="/__proxy_go?url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + videoId + '&raw=1') + '">Raw YouTube</a>' +
               '</div>' +
             '</div>' +
             '<h1 class="watch-title">' + esc(p.title || 'YouTube Video') + '</h1>' +
             '<div class="watch-author">' + esc(p.author || '') + (p.views ? ' • ' + Number(p.views).toLocaleString() + ' views' : '') + (p.client ? ' • via ' + esc(p.client) : '') + '</div>' +
             (p.description ? '<div class="desc">' + esc(p.description) + '</div>' : '') +
             '</div><aside class="related">' + relHtml + '</aside></div>';
+
+          const vidEl = document.getElementById('vid');
+          if (vidEl && startSec > 0) {
+            vidEl.addEventListener('loadedmetadata', function () { vidEl.currentTime = startSec; }, { once: true });
+          }
 
           const sel = document.getElementById('q-sel');
           if (sel) {
@@ -863,9 +975,16 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
             });
           }
 
-          document.getElementById('embed-btn').addEventListener('click', function () {
-            document.getElementById('player-box').innerHTML =
-              '<iframe src="' + PREFIX + 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(videoId) + '?autoplay=1" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+          // YouTube-style keyboard shortcuts
+          document.addEventListener('keydown', function (ev) {
+            if (ev.target && (ev.target.tagName === 'INPUT' || ev.target.tagName === 'TEXTAREA')) return;
+            const v = document.getElementById('vid');
+            if (!v) return;
+            if (ev.key === ' ' || ev.key === 'k' || ev.key === 'K') { ev.preventDefault(); v.paused ? v.play() : v.pause(); }
+            else if (ev.key === 'j' || ev.key === 'J') v.currentTime = Math.max(0, v.currentTime - 10);
+            else if (ev.key === 'l' || ev.key === 'L') v.currentTime = Math.min(v.duration || 0, v.currentTime + 10);
+            else if (ev.key === 'm' || ev.key === 'M') v.muted = !v.muted;
+            else if (ev.key === 'f' || ev.key === 'F') { document.fullscreenElement ? document.exitFullscreen() : v.requestFullscreen?.(); }
           });
         } catch (e) {
           app.innerHTML = '<div class="status">Error loading video: ' + esc(e.message) + '</div>';
@@ -878,15 +997,16 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
         if (!val) return;
         const m = val.match(/(?:v=|youtu\\.be\\/|shorts\\/|embed\\/)([a-zA-Z0-9_-]{11})/);
         if (m) {
-          window.location.href = '/yt/watch?v=' + encodeURIComponent(m[1]);
+          window.location.href = '/watch?v=' + encodeURIComponent(m[1]);
         } else {
-          window.location.href = '/yt?q=' + encodeURIComponent(val);
+          window.location.href = '/results?search_query=' + encodeURIComponent(val);
         }
       });
 
       const initV = ${JSON.stringify(safeV)};
       const initQ = ${JSON.stringify(safeQ)};
-      if (initV) loadWatch(initV);
+      const initStart = ${safeStart};
+      if (initV) loadWatch(initV, initStart);
       else loadSearch(initQ);
     })();
   </script>
@@ -945,6 +1065,9 @@ self.addEventListener('fetch', (event) => {
       p === '/' ||
       p === '/yt' ||
       p.startsWith('/yt/') ||
+      p === '/watch' ||
+      p === '/results' ||
+      p.startsWith('/shorts/') ||
       p.startsWith('/__proxy_') ||
       p.startsWith(PREFIX) ||
       /^\\/(https?|wss?):\\/\\//i.test(p)
@@ -1218,20 +1341,30 @@ export default {
       );
     }
 
-    // 4. Built-in Native YouTube Routes (/yt, /yt/watch, /yt/api/*)
+    // 4. Seamless YouTube Routes (/yt, /watch, /results, /shorts/*, /yt/api/*)
     if (url.pathname === '/yt' || url.pathname === '/yt/') {
       const q = url.searchParams.get('q') || '';
       const vid = extractVideoId(q);
       if (vid) {
-        return Response.redirect(`${proxyBase}/yt/watch?v=${vid}`, 302);
+        return Response.redirect(`${proxyBase}/watch?v=${vid}`, 302);
       }
       return renderYouTubeShell(proxyBase, q, '');
     }
 
-    if (url.pathname === '/yt/watch') {
+    if (url.pathname === '/yt/watch' || url.pathname === '/watch') {
       const v = extractVideoId(url.searchParams.get('v') || '');
       if (!v) return Response.redirect(`${proxyBase}/yt`, 302);
-      return renderYouTubeShell(proxyBase, '', v);
+      const startSec = parseStartSeconds(url.searchParams.get('t') || url.searchParams.get('start'));
+      return renderYouTubeShell(proxyBase, '', v, startSec);
+    }
+
+    if (url.pathname === '/results') {
+      return renderYouTubeShell(proxyBase, url.searchParams.get('search_query') || '', '');
+    }
+
+    if (url.pathname.startsWith('/shorts/')) {
+      const v = extractVideoId(url.pathname.split('/').filter(Boolean)[1] || '');
+      if (v) return renderYouTubeShell(proxyBase, '', v);
     }
 
     if (url.pathname === '/yt/api/search') {
@@ -1384,6 +1517,20 @@ export default {
     const fetchUrl = new URL(targetUrl.href);
     if (fetchUrl.protocol === 'ws:') fetchUrl.protocol = 'http:';
     if (fetchUrl.protocol === 'wss:') fetchUrl.protocol = 'https:';
+
+    // Seamlessly connect any proxied YouTube page or third-party embed to the working player
+    if (request.method === 'GET' && !isWebSocket) {
+      const ytRoute = matchYouTubePageRoute(fetchUrl);
+      if (ytRoute) {
+        if (ytRoute.type === 'embed') return renderYouTubeEmbed(ytRoute.videoId, ytRoute.startSeconds);
+        if (ytRoute.type === 'watch') return renderYouTubeShell(proxyBase, '', ytRoute.videoId, ytRoute.startSeconds);
+        if (ytRoute.type === 'search') return renderYouTubeShell(proxyBase, ytRoute.query, '');
+        if (ytRoute.type === 'home') return renderYouTubeShell(proxyBase, '', '');
+      }
+    }
+    if (fetchUrl.searchParams.get('raw') === '1') {
+      fetchUrl.searchParams.delete('raw');
+    }
 
     const isStreamingMedia = isStreamingMediaUrl(fetchUrl);
 

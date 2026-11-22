@@ -26,8 +26,23 @@ Connect this GitHub repository in Cloudflare Dashboard → **Workers & Pages** �
 ## Usage
 
 - Open your Worker URL (`https://web-proxy.<your-subdomain>.workers.dev`).
-- Click **▶ YouTube (Fast Player)** (or go to `/yt`) to search and watch YouTube videos directly.
-- Paste any URL (e.g., `youtube.com/watch?v=...`, `chess.com/play`, `wikipedia.org`) into the bar.
+- Click **▶ YouTube** (`/yt`) or **⚡ Shorts** (`/shorts`) to browse, search, and watch videos directly.
+- Any `youtube.com`, `youtu.be`, `youtube.com/shorts/...`, or `youtube.com/embed/...` link automatically opens in the working player.
+- Toggle between **Direct Proxy Stream** and **Official YT Player** right in the watch bar.
+
+## Optional: Official YouTube Data API v3 & Signed-In Session
+
+For the highest reliability without anonymous datacenter rate limits, you can configure optional Cloudflare Worker secrets (never committed to git):
+
+```bash
+# Official YouTube Data API v3 key (for reliable search, home feed, Shorts feed, and metadata)
+npx wrangler secret put YT_API_KEY
+
+# Optional: Your own signed-in YouTube session cookie (authenticates InnerTube as your account)
+npx wrangler secret put YT_COOKIE
+```
+
+Check `/__proxy_health` to confirm `ytApiKeyConfigured` and `ytCookieConfigured` are `true`.
 
 ## Test
 

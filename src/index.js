@@ -742,7 +742,121 @@ async function fetchInnerTubePlayer(videoId, proxyBase, env) {
   );
 }
 
-async function fetchInnerTubeSearch(query) {
+/**
+ * Format YouTube Data API v3 ISO 8601 duration (e.g. PT3M33S -> 3:33, PT1H2M5S -> 1:02:05).
+ */
+export function parseIsoDuration(iso) {
+  if (!iso) return '';
+  const m = String(iso).match(/^PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?$/i);
+  if (!m) return '';
+  const h = Number(m[1] || 0);
+  const min = Number(m[2] || 0);
+  const s = Number(m[3] || 0);
+  const pad = (n) => String(n).padStart(2, '0');
+  return h > 0 ? `${h}:${pad(min)}:${pad(s)}` : `${min}:${pad(s)}`;
+}
+
+async function fetchOfficialYouTubeSearch(query, apiKey, isShorts = false) {
+  if (!apiKey) return null;
+  try {
+    const params = new URLSearchParams({
+      part: 'snippet',
+      type: 'video',
+      maxResults: '24',
+      key: apiKey,
+    });
+    if (query) {
+      params.set('q', isShorts ? `${query} #shorts` : query);
+    } else if (isShorts) {
+      params.set('q', '#shorts');
+    } else {
+      // Home feed: official mostPopular chart
+      const popUrl = `https://www.googleapis.com/youtube/v3/videos?part=snippet,contentDetails,statistics&chart=mostPopular&regionCode=US&maxResults=24&key=${encodeURIComponent(apiKey)}`;
+      const popResp = await fetch(popUrl);
+      if (!popResp.ok) return null;
+      const popJson = await popResp.json();
+      return (popJson.items || []).map((it) => ({
+        id: it.id,
+        title: it.snippet?.title || '',
+        author: it.snippet?.channelTitle || '',
+        views: it.statistics?.viewCount ? `${Number(it.statistics.viewCount).toLocaleString()} views` : '',
+        length: parseIsoDuration(it.contentDetails?.duration),
+        published: (it.snippet?.publishedAt || '').slice(0, 10),
+        isShort: false,
+      }));
+    }
+
+    if (isShorts) params.set('videoDuration', 'short');
+    const resp = await fetch(`https://www.googleapis.com/youtube/v3/search?${params.toString()}`);
+    if (!resp.ok) return null;
+    const data = await resp.json();
+    const items = (data.items || []).filter((it) => it?.id?.videoId);
+    if (!items.length) return [];
+
+    // Fetch durations & view counts in a single batch call
+    const ids = items.map((it) => it.id.videoId).join(',');
+    const metaMap = new Map();
+    try {
+      const mResp = await fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=contentDetails,statistics&id=${encodeURIComponent(ids)}&key=${encodeURIComponent(apiKey)}`
+      );
+      if (mResp.ok) {
+        const mJson = await mResp.json();
+        for (const v of mJson.items || []) metaMap.set(v.id, v);
+      }
+    } catch {
+      // optional enrichment
+    }
+
+    return items.map((it) => {
+      const id = it.id.videoId;
+      const meta = metaMap.get(id);
+      const dur = parseIsoDuration(meta?.contentDetails?.duration);
+      return {
+        id,
+        title: it.snippet?.title || '',
+        author: it.snippet?.channelTitle || '',
+        views: meta?.statistics?.viewCount
+          ? `${Number(meta.statistics.viewCount).toLocaleString()} views`
+          : '',
+        length: isShorts ? 'SHORT' : dur,
+        published: (it.snippet?.publishedAt || '').slice(0, 10),
+        isShort: isShorts,
+      };
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function fetchOfficialYouTubeVideoMeta(videoId, apiKey) {
+  if (!apiKey) return null;
+  try {
+    const resp = await fetch(
+      `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics,contentDetails&id=${encodeURIComponent(videoId)}&key=${encodeURIComponent(apiKey)}`
+    );
+    if (!resp.ok) return null;
+    const j = await resp.json();
+    const it = j.items?.[0];
+    if (!it) return null;
+    return {
+      title: it.snippet?.title || '',
+      author: it.snippet?.channelTitle || '',
+      views: it.statistics?.viewCount || '',
+      description: it.snippet?.description || '',
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function fetchInnerTubeSearch(query, env) {
+  // Prefer official YouTube Data API v3 when YT_API_KEY secret is configured
+  if (env && env.YT_API_KEY) {
+    const official = await fetchOfficialYouTubeSearch(query, env.YT_API_KEY, false);
+    if (official && official.length > 0) return official;
+  }
+
   const endpoint = query
     ? 'https://www.youtube.com/youtubei/v1/search?prettyPrint=false'
     : 'https://www.youtube.com/youtubei/v1/browse?prettyPrint=false';
@@ -765,7 +879,7 @@ async function fetchInnerTubeSearch(query) {
         'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
       Origin: 'https://www.youtube.com',
       Referer: 'https://www.youtube.com/',
-      Cookie: 'CONSENT=YES+cb',
+      Cookie: env && env.YT_COOKIE ? env.YT_COOKIE : 'CONSENT=YES+cb',
     },
     body: JSON.stringify(payload),
   });
@@ -774,7 +888,7 @@ async function fetchInnerTubeSearch(query) {
   return parseSearchVideos(data, 30);
 }
 
-async function fetchInnerTubeRelated(videoId) {
+async function fetchInnerTubeRelated(videoId, env) {
   try {
     const resp = await fetch('https://www.youtube.com/youtubei/v1/next?prettyPrint=false', {
       method: 'POST',
@@ -784,7 +898,7 @@ async function fetchInnerTubeRelated(videoId) {
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
         Origin: 'https://www.youtube.com',
         Referer: 'https://www.youtube.com/',
-        Cookie: 'CONSENT=YES+cb',
+        Cookie: env && env.YT_COOKIE ? env.YT_COOKIE : 'CONSENT=YES+cb',
       },
       body: JSON.stringify({
         videoId,
@@ -799,7 +913,13 @@ async function fetchInnerTubeRelated(videoId) {
   }
 }
 
-async function fetchInnerTubeShorts(query) {
+async function fetchInnerTubeShorts(query, env) {
+  // Prefer official YouTube Data API v3 when YT_API_KEY secret is configured
+  if (env && env.YT_API_KEY) {
+    const official = await fetchOfficialYouTubeSearch(query, env.YT_API_KEY, true);
+    if (official && official.length > 0) return official;
+  }
+
   try {
     const q = query ? `${query} #shorts` : '#shorts';
     const resp = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
@@ -810,7 +930,7 @@ async function fetchInnerTubeShorts(query) {
           'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
         Origin: 'https://www.youtube.com',
         Referer: 'https://www.youtube.com/',
-        Cookie: 'CONSENT=YES+cb',
+        Cookie: env && env.YT_COOKIE ? env.YT_COOKIE : 'CONSENT=YES+cb',
       },
       body: JSON.stringify({
         query: q,
@@ -1173,11 +1293,16 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId, startSecond
             streams.push({ label: 'Audio Only', url: p.audio[0].url, type: 'audio' });
           }
 
+          const prefOfficial = localStorage.getItem('yt_player_mode') === 'official';
+          function officialEmbedHtml() {
+            return '<iframe src="https://www.youtube-nocookie.com/embed/' + encodeURIComponent(videoId) + '?autoplay=1' + (startSec > 0 ? '&start=' + startSec : '') + '" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+          }
+
           let playerHtml = '';
-          if (streams.length > 0) {
+          if (!prefOfficial && streams.length > 0) {
             playerHtml = '<video id="vid" controls autoplay playsinline src="' + esc(streams[0].url) + '"></video>';
           } else {
-            playerHtml = '<iframe src="' + PREFIX + 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(videoId) + '?autoplay=1&raw=1" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+            playerHtml = officialEmbedHtml();
           }
 
           const optionsHtml = streams.map(function (s, i) {
@@ -1195,8 +1320,9 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId, startSecond
             '<div class="watch-layout"><div>' +
             '<div class="player-box" id="player-box">' + playerHtml + '</div>' +
             '<div class="watch-bar">' +
-              (streams.length ? '<select id="q-sel">' + optionsHtml + '</select>' : '<span class="sub">Using YouTube Embed Player</span>') +
+              (streams.length ? '<select id="q-sel">' + optionsHtml + '</select>' : '<span class="sub">Official YouTube Player</span>') +
               '<div style="display:flex;gap:.4rem;flex-wrap:wrap;">' +
+                '<button class="nav-btn" id="mode-btn">' + (prefOfficial || !streams.length ? 'Direct Proxy Stream' : 'Official YT Player') + '</button>' +
                 '<a class="nav-btn" href="/__proxy_go?url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + videoId + '&raw=1') + '">Raw YouTube</a>' +
               '</div>' +
             '</div>' +
@@ -1204,6 +1330,23 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId, startSecond
             '<div class="watch-author">' + esc(p.author || '') + (p.views ? ' • ' + Number(p.views).toLocaleString() + ' views' : '') + (p.client ? ' • via ' + esc(p.client) : '') + '</div>' +
             (p.description ? '<div class="desc">' + esc(p.description) + '</div>' : '') +
             '</div><aside class="related">' + relHtml + '</aside></div>';
+
+          const modeBtn = document.getElementById('mode-btn');
+          if (modeBtn) {
+            modeBtn.addEventListener('click', function () {
+              const box = document.getElementById('player-box');
+              const currentlyOfficial = !document.getElementById('vid');
+              if (currentlyOfficial && streams.length > 0) {
+                localStorage.setItem('yt_player_mode', 'direct');
+                box.innerHTML = '<video id="vid" controls autoplay playsinline src="' + esc(streams[0].url) + '"></video>';
+                modeBtn.textContent = 'Official YT Player';
+              } else {
+                localStorage.setItem('yt_player_mode', 'official');
+                box.innerHTML = officialEmbedHtml();
+                modeBtn.textContent = 'Direct Proxy Stream';
+              }
+            });
+          }
 
           const vidEl = document.getElementById('vid');
           if (vidEl && startSec > 0) {
@@ -1581,6 +1724,8 @@ export default {
           ok: true,
           runtime: 'cloudflare-worker',
           youtube: true,
+          ytApiKeyConfigured: Boolean(env && env.YT_API_KEY),
+          ytCookieConfigured: Boolean(env && env.YT_COOKIE),
           websockets: true,
           serviceWorker: true,
           streamingHtml: typeof HTMLRewriter !== 'undefined',
@@ -1618,7 +1763,7 @@ export default {
 
     if (url.pathname === '/yt/api/shorts') {
       const q = url.searchParams.get('q') || '';
-      const videos = await fetchInnerTubeShorts(q);
+      const videos = await fetchInnerTubeShorts(q, env);
       return new Response(JSON.stringify({ videos }), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=120', ...corsHeaders(request) },
       });
@@ -1626,7 +1771,7 @@ export default {
 
     if (url.pathname === '/yt/api/search') {
       const q = url.searchParams.get('q') || '';
-      const videos = await fetchInnerTubeSearch(q);
+      const videos = await fetchInnerTubeSearch(q, env);
       return new Response(JSON.stringify({ videos }), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=120', ...corsHeaders(request) },
       });
@@ -1641,6 +1786,10 @@ export default {
         });
       }
       const data = await fetchInnerTubePlayer(v, proxyBase, env);
+      if (env && env.YT_API_KEY && !data.title) {
+        const meta = await fetchOfficialYouTubeVideoMeta(v, env.YT_API_KEY);
+        if (meta) Object.assign(data, meta);
+      }
       return new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders(request) },
       });
@@ -1648,7 +1797,7 @@ export default {
 
     if (url.pathname === '/yt/api/related') {
       const v = extractVideoId(url.searchParams.get('v') || '');
-      const videos = v ? await fetchInnerTubeRelated(v) : [];
+      const videos = v ? await fetchInnerTubeRelated(v, env) : [];
       return new Response(JSON.stringify({ videos }), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300', ...corsHeaders(request) },
       });

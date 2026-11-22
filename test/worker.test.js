@@ -6,6 +6,7 @@ import worker, {
   SW_PATH,
   extractVideoId,
   parseStartSeconds,
+  parseIsoDuration,
   matchYouTubePageRoute,
   parseSearchVideos,
   extractPlayableStreams,
@@ -264,6 +265,70 @@ test('Cloudflare Worker endpoints: /yt, /yt/api/player, /__proxy_sw.js, googlevi
     assert.equal(lastInit.headers.get('origin'), 'https://www.youtube.com');
     assert.equal(lastInit.headers.get('referer'), 'https://www.youtube.com/');
     assert.equal(gvResp.headers.get('access-control-expose-headers'), '*');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('Official YouTube Data API v3 integration (YT_API_KEY) and parseIsoDuration', async () => {
+  assert.equal(parseIsoDuration('PT3M33S'), '3:33');
+  assert.equal(parseIsoDuration('PT1H2M5S'), '1:02:05');
+  assert.equal(parseIsoDuration('PT45S'), '0:45');
+
+  const health = await worker.fetch(
+    new Request('https://my.workers.dev/__proxy_health'),
+    { YT_API_KEY: 'test-key', YT_COOKIE: 'SID=1' },
+    {}
+  );
+  const hJson = await health.json();
+  assert.equal(hJson.ytApiKeyConfigured, true);
+  assert.equal(hJson.ytCookieConfigured, true);
+
+  const origFetch = globalThis.fetch;
+  globalThis.fetch = async (u) => {
+    const s = String(u);
+    if (s.includes('googleapis.com/youtube/v3/search')) {
+      return new Response(
+        JSON.stringify({
+          items: [
+            {
+              id: { videoId: 'dQw4w9WgXcQ' },
+              snippet: { title: 'Official API Result', channelTitle: 'Rick Astley', publishedAt: '2009-10-25T00:00:00Z' },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    if (s.includes('googleapis.com/youtube/v3/videos')) {
+      return new Response(
+        JSON.stringify({
+          items: [
+            {
+              id: 'dQw4w9WgXcQ',
+              contentDetails: { duration: 'PT3M33S' },
+              statistics: { viewCount: '1500000000' },
+            },
+          ],
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    return new Response('{}', { status: 404 });
+  };
+
+  try {
+    const resp = await worker.fetch(
+      new Request('https://my.workers.dev/yt/api/search?q=rick'),
+      { YT_API_KEY: 'test-key' },
+      {}
+    );
+    assert.equal(resp.status, 200);
+    const data = await resp.json();
+    assert.equal(data.videos.length, 1);
+    assert.equal(data.videos[0].id, 'dQw4w9WgXcQ');
+    assert.equal(data.videos[0].title, 'Official API Result');
+    assert.equal(data.videos[0].length, '3:33');
   } finally {
     globalThis.fetch = origFetch;
   }

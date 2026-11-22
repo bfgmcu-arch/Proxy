@@ -328,6 +328,30 @@ export function parseSearchVideos(data, limit = 30) {
       });
       return;
     }
+    const lvm = node.lockupViewModel;
+    if (lvm && lvm.contentType === 'LOCKUP_CONTENT_TYPE_VIDEO' && lvm.contentId && !seen.has(lvm.contentId)) {
+      seen.add(lvm.contentId);
+      const meta = lvm.metadata?.lockupMetadataViewModel;
+      const rows = meta?.metadata?.contentMetadataViewModel?.metadataRows || [];
+      const author = rows[0]?.metadataParts?.[0]?.text?.content || '';
+      const views = rows[1]?.metadataParts?.[0]?.text?.content || '';
+      const published = rows[1]?.metadataParts?.[1]?.text?.content || '';
+      const overlays = lvm.contentImage?.thumbnailViewModel?.overlays || [];
+      let length = '';
+      for (const ov of overlays) {
+        const badge = ov?.thumbnailOverlayBadgeViewModel?.thumbnailBadges?.[0]?.thumbnailBadgeViewModel?.text;
+        if (badge) { length = badge; break; }
+      }
+      results.push({
+        id: lvm.contentId,
+        title: meta?.title?.content || '',
+        author,
+        views,
+        length,
+        published,
+      });
+      return;
+    }
     for (const key of Object.keys(node)) {
       if (results.length >= limit) break;
       walk(node[key]);
@@ -383,38 +407,26 @@ export function extractPlayableStreams(playerJson, proxyBase) {
   };
 }
 
+const ANDROID_UA = 'com.google.android.youtube/20.10.38 (Linux; U; Android 14) gzip';
+const IOS_UA = 'com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)';
+const ANDROID_VR_UA =
+  'com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip';
+
 const INNERTUBE_CLIENTS = [
   {
-    name: 'IOS',
-    userAgent: 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
-    clientHeader: '5',
-    versionHeader: '19.29.1',
-    body: (videoId) => ({
-      videoId,
-      context: {
-        client: {
-          clientName: 'IOS',
-          clientVersion: '19.29.1',
-          deviceMake: 'Apple',
-          deviceModel: 'iPhone16,2',
-          hl: 'en',
-          gl: 'US',
-        },
-      },
-    }),
-  },
-  {
     name: 'ANDROID',
-    userAgent: 'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
+    userAgent: ANDROID_UA,
     clientHeader: '3',
-    versionHeader: '19.29.37',
+    versionHeader: '20.10.38',
     body: (videoId) => ({
       videoId,
       context: {
         client: {
           clientName: 'ANDROID',
-          clientVersion: '19.29.37',
+          clientVersion: '20.10.38',
           androidSdkVersion: 34,
+          osName: 'Android',
+          osVersion: '14',
           hl: 'en',
           gl: 'US',
         },
@@ -422,28 +434,157 @@ const INNERTUBE_CLIENTS = [
     }),
   },
   {
-    name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-    userAgent:
-      'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
-    clientHeader: '85',
-    versionHeader: '2.0',
+    name: 'IOS',
+    userAgent: IOS_UA,
+    clientHeader: '5',
+    versionHeader: '20.10.4',
     body: (videoId) => ({
       videoId,
       context: {
         client: {
-          clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
-          clientVersion: '2.0',
+          clientName: 'IOS',
+          clientVersion: '20.10.4',
+          deviceMake: 'Apple',
+          deviceModel: 'iPhone16,2',
+          osName: 'iPhone',
+          osVersion: '18.3.2.22D82',
           hl: 'en',
           gl: 'US',
         },
-        thirdParty: { embedUrl: 'https://www.youtube.com/' },
+      },
+    }),
+  },
+  {
+    name: 'ANDROID_VR',
+    userAgent: ANDROID_VR_UA,
+    clientHeader: '28',
+    versionHeader: '1.65.10',
+    body: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'ANDROID_VR',
+          clientVersion: '1.65.10',
+          deviceMake: 'Oculus',
+          deviceModel: 'Quest 3',
+          androidSdkVersion: 32,
+          osName: 'Android',
+          osVersion: '12L',
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+    }),
+  },
+  {
+    name: 'TVHTML5',
+    userAgent: 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
+    clientHeader: '7',
+    versionHeader: '7.20250310.17.00',
+    body: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'TVHTML5',
+          clientVersion: '7.20250310.17.00',
+          hl: 'en',
+          gl: 'US',
+        },
       },
     }),
   },
 ];
 
-async function fetchInnerTubePlayer(videoId, proxyBase) {
+const DEFAULT_PIPED_APIS = [
+  'https://api.piped.private.coffee',
+  'https://pipedapi.kavin.rocks',
+];
+
+async function probeStreamOk(rawUrl, userAgent) {
+  try {
+    const r = await fetch(rawUrl, {
+      headers: { Range: 'bytes=0-0', 'User-Agent': userAgent || ANDROID_UA },
+      redirect: 'follow',
+    });
+    return r.status === 200 || r.status === 206;
+  } catch {
+    return false;
+  }
+}
+
+async function fetchPipedFallback(videoId, proxyBase, env) {
+  const custom = env && env.PIPED_APIS
+    ? env.PIPED_APIS.split(',').map((s) => s.trim().replace(/\/+$/, '')).filter(Boolean)
+    : [];
+  const apis = [...custom, ...DEFAULT_PIPED_APIS];
+
+  for (const apiBase of apis) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 4500);
+      const resp = await fetch(`${apiBase}/streams/${encodeURIComponent(videoId)}`, {
+        signal: ctrl.signal,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+      clearTimeout(timer);
+      if (!resp.ok) continue;
+      const j = await resp.json();
+
+      const muxed = (j.videoStreams || [])
+        .filter(
+          (s) =>
+            s &&
+            typeof s.url === 'string' &&
+            !s.videoOnly &&
+            !/lbry/i.test(String(s.quality || '')) &&
+            !s.url.includes('odycdn.com')
+        )
+        .map((s) => ({
+          itag: s.itag || 0,
+          quality: s.quality || 'MP4',
+          mimeType: s.mimeType || 'video/mp4',
+          url: `${proxyBase}${PREFIX}${s.url}`,
+        }));
+
+      const audio = (j.audioStreams || [])
+        .filter((s) => s && typeof s.url === 'string' && !s.url.includes('odycdn.com'))
+        .map((s) => ({
+          itag: s.itag || 0,
+          bitrate: s.bitrate || 0,
+          mimeType: s.mimeType || 'audio/mp4',
+          url: `${proxyBase}${PREFIX}${s.url}`,
+        }))
+        .sort((a, b) => b.bitrate - a.bitrate);
+
+      const hlsUrl = j.hls ? `${proxyBase}${PREFIX}${j.hls}` : null;
+
+      if (muxed.length > 0 || hlsUrl) {
+        return {
+          status: 'OK',
+          reason: '',
+          client: 'PIPED (' + new URL(apiBase).host + ')',
+          videoId,
+          title: j.title || '',
+          author: j.uploader || '',
+          views: String(j.views || ''),
+          lengthSeconds: Number(j.duration || 0),
+          description: j.description || '',
+          muxed,
+          audio,
+          hlsUrl,
+        };
+      }
+    } catch {
+      // try next Piped instance
+    }
+  }
+  return null;
+}
+
+async function fetchInnerTubePlayer(videoId, proxyBase, env) {
   let lastResult = null;
+  const cookie = env && env.YT_COOKIE ? env.YT_COOKIE : 'CONSENT=YES+cb';
+
   for (const client of INNERTUBE_CLIENTS) {
     try {
       const resp = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
@@ -455,7 +596,7 @@ async function fetchInnerTubePlayer(videoId, proxyBase) {
           'X-YouTube-Client-Version': client.versionHeader,
           Origin: 'https://www.youtube.com',
           Referer: 'https://www.youtube.com/',
-          Cookie: 'CONSENT=YES+cb',
+          Cookie: cookie,
         },
         body: JSON.stringify(client.body(videoId)),
       });
@@ -464,16 +605,26 @@ async function fetchInnerTubePlayer(videoId, proxyBase) {
       const parsed = extractPlayableStreams(json, proxyBase);
       lastResult = { ...parsed, client: client.name };
       if (parsed.status === 'OK' && (parsed.muxed.length > 0 || parsed.hlsUrl)) {
-        return lastResult;
+        const rawProbeUrl =
+          (json.streamingData?.formats || []).find((f) => f.url)?.url ||
+          json.streamingData?.hlsManifestUrl;
+        if (!rawProbeUrl || (await probeStreamOk(rawProbeUrl, client.userAgent))) {
+          return lastResult;
+        }
       }
     } catch {
       // try next client
     }
   }
+
+  // Fallback to Piped public API when Cloudflare datacenter IP gets LOGIN_REQUIRED or 403
+  const piped = await fetchPipedFallback(videoId, proxyBase, env);
+  if (piped) return piped;
+
   return (
     lastResult || {
       status: 'ERROR',
-      reason: 'Could not extract streams from YouTube InnerTube',
+      reason: 'Could not extract streams from YouTube',
       videoId,
       muxed: [],
       audio: [],
@@ -1099,7 +1250,7 @@ export default {
           headers: { 'Content-Type': 'application/json', ...corsHeaders(request) },
         });
       }
-      const data = await fetchInnerTubePlayer(v, proxyBase);
+      const data = await fetchInnerTubePlayer(v, proxyBase, env);
       return new Response(JSON.stringify(data), {
         headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders(request) },
       });
@@ -1274,6 +1425,9 @@ export default {
     }
     if (isGoogleVideo) {
       newHeaders.set('Referer', 'https://www.youtube.com/');
+      const cParam = (fetchUrl.searchParams.get('c') || '').toUpperCase();
+      if (cParam === 'ANDROID') newHeaders.set('User-Agent', ANDROID_UA);
+      else if (cParam === 'IOS') newHeaders.set('User-Agent', IOS_UA);
     } else if (refererHeader) {
       const refTarget = extractProxiedTarget(refererHeader);
       newHeaders.set('Referer', refTarget ? refTarget.href : fetchUrl.origin + '/');
@@ -1310,12 +1464,12 @@ export default {
       }
     }
 
-    // 11. Fetch upstream
+    // 11. Fetch upstream (follow 302s transparently for googlevideo.com media streams)
     const fetchInit = {
       method: request.method,
       headers: newHeaders,
       body: ['GET', 'HEAD'].includes(request.method) ? null : request.body,
-      redirect: 'manual',
+      redirect: isStreamingMedia ? 'follow' : 'manual',
     };
     if (isCacheableStatic) {
       fetchInit.cf = { cacheTtl: 86400, cacheEverything: true };

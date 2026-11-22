@@ -7,7 +7,6 @@ import worker from '../src/index.js';
 import { createProxyServer } from '../server.js';
 import {
   RUNTIME_PATH,
-  isBlockedHost,
   isStaticAssetUrl,
   normalizeTargetUrl,
   resolveIncomingTargetUrl,
@@ -22,16 +21,6 @@ test('normalizeTargetUrl fixes collapsed protocol slashes', () => {
   assert.equal(normalizeTargetUrl('https:/www.chess.com/play'), 'https://www.chess.com/play');
   assert.equal(normalizeTargetUrl('wss:/live1.chess.com/cometd'), 'wss://live1.chess.com/cometd');
   assert.equal(normalizeTargetUrl('https://www.chess.com/play'), 'https://www.chess.com/play');
-});
-
-test('isBlockedHost blocks ads/trackers without blocking chess.com or cloudflare', () => {
-  assert.equal(isBlockedHost('securepubads.g.doubleclick.net'), true);
-  assert.equal(isBlockedHost('www.googletagmanager.com'), true);
-  assert.equal(isBlockedHost('bam.nr-data.net'), true);
-  assert.equal(isBlockedHost('www.chess.com'), false);
-  assert.equal(isBlockedHost('images.chesscomfiles.com'), false);
-  assert.equal(isBlockedHost('live1.chess.com'), false);
-  assert.equal(isBlockedHost('challenges.cloudflare.com'), false);
 });
 
 test('isStaticAssetUrl detects Chess.com CDN and static file extensions', () => {
@@ -101,14 +90,13 @@ test('stripInternalParams extracts __proxy_origin cleanly', () => {
   assert.equal(computeUpstreamOrigin(cleanedUrl, null, explicitOrigin), 'https://www.chess.com');
 });
 
-test('Cloudflare Worker fast paths: health, immutable runtime, edge ad/tracker block, static asset caching', async () => {
+test('Cloudflare Worker fast paths: health, immutable runtime, all websites allowed, static asset caching', async () => {
   // 1. Health check
   const health = await worker.fetch(new Request('https://my-proxy.workers.dev/__proxy_health'), {}, {});
   assert.equal(health.status, 200);
   const hJson = await health.json();
   assert.equal(hJson.ok, true);
   assert.equal(hJson.runtime, 'cloudflare-worker');
-  assert.equal(hJson.adblock, true);
 
   // 2. Static immutable runtime script
   const rt = await worker.fetch(new Request(`https://my-proxy.workers.dev${RUNTIME_PATH}`), {}, {});
@@ -118,24 +106,7 @@ test('Cloudflare Worker fast paths: health, immutable runtime, edge ad/tracker b
   const rtBody = await rt.text();
   assert.match(rtBody, /__PROXY_RT__/);
 
-  // 3. Edge ad/tracker blocking (0 upstream fetch!)
-  const blockedJs = await worker.fetch(
-    new Request('https://my-proxy.workers.dev/https://www.googletagmanager.com/gtm.js'),
-    {},
-    {}
-  );
-  assert.equal(blockedJs.status, 200);
-  assert.equal(await blockedJs.text(), '/* blocked */');
-  assert.match(blockedJs.headers.get('cache-control'), /max-age=86400/);
-
-  const blockedBeacon = await worker.fetch(
-    new Request('https://my-proxy.workers.dev/https://stats.g.doubleclick.net/r/collect'),
-    {},
-    {}
-  );
-  assert.equal(blockedBeacon.status, 204);
-
-  // 4. Static asset fetch strips Cookie on chesscomfiles.com and sets cf cache + browser Cache-Control
+  // 3. Arbitrary websites & static assets are all allowed; static assets set cf cache + Cache-Control
   const origFetch = globalThis.fetch;
   let capturedUrl = null;
   let capturedInit = null;
@@ -148,6 +119,14 @@ test('Cloudflare Worker fast paths: health, immutable runtime, edge ad/tracker b
     });
   };
   try {
+    const anyResp = await worker.fetch(
+      new Request('https://my-proxy.workers.dev/https://example.org/hello'),
+      {},
+      { waitUntil() {} }
+    );
+    assert.equal(anyResp.status, 200);
+    assert.equal(capturedUrl, 'https://example.org/hello');
+
     const assetResp = await worker.fetch(
       new Request('https://my-proxy.workers.dev/https://images.chesscomfiles.com/wk.png', {
         headers: { Cookie: 'secret=123' },

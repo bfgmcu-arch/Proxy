@@ -2,7 +2,6 @@ import {
   HEALTH_PATH,
   RUNTIME_PATH,
   CLIENT_RUNTIME_SCRIPT,
-  isBlockedHost,
   isStaticAssetUrl,
   resolveIncomingTargetUrl,
   extractProxiedTarget,
@@ -42,21 +41,6 @@ function streamRewriteHtml(response, baseUrl, proxyBase) {
     element(el) {
       const val = el.getAttribute(attrName);
       if (!val) return;
-      if (!isSrcset) {
-        try {
-          const resolved = new URL(val.trim(), baseUrl);
-          // Drop ad/tracker scripts & iframes directly from the HTML stream
-          if (
-            (el.tagName === 'script' || el.tagName === 'iframe') &&
-            isBlockedHost(resolved.hostname)
-          ) {
-            el.remove();
-            return;
-          }
-        } catch {
-          // ignore
-        }
-      }
       const next = isSrcset
         ? rewriteSrcset(val, baseUrl, proxyBase)
         : rewriteUrl(val, baseUrl, proxyBase);
@@ -155,7 +139,6 @@ export default {
           runtime: 'cloudflare-worker',
           websockets: true,
           streamingHtml: typeof HTMLRewriter !== 'undefined',
-          adblock: true,
         }),
         {
           status: 200,
@@ -187,10 +170,10 @@ export default {
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Chess.com Cloudflare Proxy</title>
+  <title>Cloudflare Web Proxy</title>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #161512; color: #ecebe8; margin: 0; }
-    .container { background: #262421; border: 1px solid #3a3733; padding: 2rem; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); width: min(440px, 92vw); }
+    .container { background: #262421; border: 1px solid #3a3733; padding: 2rem; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); width: min(460px, 92vw); }
     h2 { margin: 0 0 0.4rem; font-size: 1.35rem; }
     p { margin: 0 0 1rem; color: #a6a39e; font-size: 0.85rem; }
     form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
@@ -204,18 +187,17 @@ export default {
 </head>
 <body>
   <div class="container">
-    <h2>♞ Cloudflare Chess Proxy</h2>
-    <p>Streaming HTMLRewriter • WebSockets • Edge Asset Cache • Ad/Tracker Blocker</p>
+    <h2>🌐 Cloudflare Web Proxy</h2>
+    <p>All Websites Allowed • Streaming HTMLRewriter • WebSockets • Edge Asset Cache</p>
     <form action="/" method="GET" id="proxy-form">
-      <input type="text" name="url" placeholder="https://www.chess.com/play" required>
+      <input type="text" name="url" placeholder="Enter any URL (e.g. https://www.chess.com/play)" required>
       <button type="submit">Go</button>
     </form>
     <div class="quick">
-      <a class="btn" href="/https://www.chess.com/play">♟ Play</a>
-      <a class="btn" href="/https://www.chess.com/play/online">🌐 Online</a>
+      <a class="btn" href="/https://www.chess.com/play">♟ Chess.com</a>
       <a class="btn" href="/https://www.chess.com/play/computer">🤖 Bots</a>
       <a class="btn" href="/https://www.chess.com/puzzles">🧩 Puzzles</a>
-      <a class="btn" href="/https://www.chess.com/login_and_go">🔑 Login</a>
+      <a class="btn" href="/https://www.wikipedia.org">📚 Wikipedia</a>
     </div>
     <script>
       document.getElementById('proxy-form').addEventListener('submit', function(e) {
@@ -251,20 +233,7 @@ export default {
     if (fetchUrl.protocol === 'ws:') fetchUrl.protocol = 'http:';
     if (fetchUrl.protocol === 'wss:') fetchUrl.protocol = 'https:';
 
-    // 7. Fast path: Block ad/tracker/telemetry hosts at the edge (saves CPU & upstream fetches)
-    if (!isWebSocket && isBlockedHost(fetchUrl.hostname)) {
-      const isJs = /\.m?js(?:$|\?)/i.test(fetchUrl.pathname);
-      return new Response(isJs ? '/* blocked */' : null, {
-        status: isJs ? 200 : 204,
-        headers: {
-          ...(isJs ? { 'Content-Type': 'application/javascript; charset=utf-8' } : {}),
-          'Cache-Control': 'public, max-age=86400',
-          ...corsHeaders(request),
-        },
-      });
-    }
-
-    // 8. Check Cloudflare Edge Cache for GET static assets
+    // 7. Check Cloudflare Edge Cache for GET static assets
     const isCacheableStatic =
       request.method === 'GET' && !isWebSocket && isStaticAssetUrl(fetchUrl);
     const edgeCache =

@@ -73,6 +73,25 @@ test('parseStartSeconds and matchYouTubePageRoute seamlessly map all YouTube URL
   );
   assert.equal(embResp.status, 200);
   assert.match(await embResp.text(), /YouTube Embed/);
+
+  // Shorts routing: both /shorts/ID and proxied youtube.com/shorts/ID open vertical Shorts UI
+  assert.deepEqual(
+    matchYouTubePageRoute(new URL('https://www.youtube.com/shorts/IR3ZWc0XDzE')),
+    { type: 'shorts', videoId: 'IR3ZWc0XDzE' }
+  );
+  assert.deepEqual(
+    matchYouTubePageRoute(new URL('https://www.youtube.com/shorts')),
+    { type: 'shorts', videoId: '' }
+  );
+  const shResp = await worker.fetch(
+    new Request('https://my.workers.dev/-----https://www.youtube.com/shorts/IR3ZWc0XDzE'),
+    {},
+    {}
+  );
+  assert.equal(shResp.status, 200);
+  const shHtml = await shResp.text();
+  assert.match(shHtml, /YouTube Shorts/);
+  assert.match(shHtml, /IR3ZWc0XDzE/);
 });
 
 test('parseSearchVideos extracts videoRenderer items from InnerTube JSON', () => {

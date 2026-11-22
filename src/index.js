@@ -350,7 +350,12 @@ export function matchYouTubePageRoute(targetUrl) {
     if (id) return { type: 'watch', videoId: id, startSeconds };
   }
 
-  if ((parts[0] === 'shorts' || parts[0] === 'live') && parts[1]) {
+  if (parts[0] === 'shorts') {
+    const id = parts[1] ? extractVideoId(parts[1]) : '';
+    return { type: 'shorts', videoId: id || '' };
+  }
+
+  if (parts[0] === 'live' && parts[1]) {
     const id = extractVideoId(parts[1]);
     if (id) return { type: 'watch', videoId: id, startSeconds };
   }
@@ -386,16 +391,49 @@ export function parseSearchVideos(data, limit = 30) {
       for (let i = 0; i < node.length && results.length < limit; i++) walk(node[i]);
       return;
     }
+    const sl = node.shortsLockupViewModel;
+    if (sl) {
+      const id = sl.onTap?.innertubeCommand?.reelWatchEndpoint?.videoId;
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        results.push({
+          id,
+          title: sl.overlayMetadata?.primaryText?.content || sl.accessibilityText || '',
+          author: '',
+          views: sl.overlayMetadata?.secondaryText?.content || '',
+          length: 'SHORT',
+          published: '',
+          isShort: true,
+        });
+        return;
+      }
+    }
+    const ri = node.reelItemRenderer;
+    if (ri && ri.videoId && !seen.has(ri.videoId)) {
+      seen.add(ri.videoId);
+      results.push({
+        id: ri.videoId,
+        title: ytText(ri.headline),
+        author: '',
+        views: ytText(ri.viewCountText),
+        length: 'SHORT',
+        published: '',
+        isShort: true,
+      });
+      return;
+    }
     const vr = node.videoRenderer || node.compactVideoRenderer || node.gridVideoRenderer;
     if (vr && vr.videoId && !seen.has(vr.videoId)) {
       seen.add(vr.videoId);
+      const isShort = Boolean(vr.navigationEndpoint?.reelWatchEndpoint);
       results.push({
         id: vr.videoId,
         title: ytText(vr.title),
         author: ytText(vr.ownerText || vr.longBylineText || vr.shortBylineText),
         views: ytText(vr.shortViewCountText || vr.viewCountText),
-        length: ytText(vr.lengthText),
+        length: isShort ? 'SHORT' : ytText(vr.lengthText),
         published: ytText(vr.publishedTimeText),
+        isShort,
       });
       return;
     }
@@ -761,6 +799,35 @@ async function fetchInnerTubeRelated(videoId) {
   }
 }
 
+async function fetchInnerTubeShorts(query) {
+  try {
+    const q = query ? `${query} #shorts` : '#shorts';
+    const resp = await fetch('https://www.youtube.com/youtubei/v1/search?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36',
+        Origin: 'https://www.youtube.com',
+        Referer: 'https://www.youtube.com/',
+        Cookie: 'CONSENT=YES+cb',
+      },
+      body: JSON.stringify({
+        query: q,
+        params: 'EgIYAQ%3D%3D',
+        context: { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: 'en', gl: 'US' } },
+      }),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    const all = parseSearchVideos(data, 40);
+    const shortsOnly = all.filter((v) => v.isShort || /^0:\d\d$/.test(v.length));
+    return shortsOnly.length > 0 ? shortsOnly.slice(0, 25) : all.slice(0, 20);
+  } catch {
+    return [];
+  }
+}
+
 function escapeHtml(str) {
   return String(str || '')
     .replace(/&/g, '&amp;')
@@ -801,6 +868,185 @@ function renderYouTubeEmbed(videoId, startSeconds = 0) {
 </body>
 </html>`,
     { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } }
+  );
+}
+
+function renderYouTubeShorts(initialVideoId = '', initialQuery = '') {
+  const safeV = JSON.stringify(initialVideoId || '');
+  const safeQ = escapeHtml(initialQuery || '');
+  return new Response(
+    `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube Shorts — Cloudflare Proxy</title>
+  <style>
+    :root { --bg:#0f0f0f; --surf:#1c1c1c; --hover:#2a2a2a; --border:#303030; --text:#f1f1f1; --muted:#aaa; --red:#ff0033; }
+    * { box-sizing:border-box; }
+    html, body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Roboto,sans-serif; overflow:hidden; }
+    header { height:56px; display:flex; align-items:center; gap:.65rem; padding:0 1rem; background:rgba(15,15,15,.95); border-bottom:1px solid var(--border); }
+    .logo { display:flex; align-items:center; gap:.35rem; font-weight:800; font-size:1.05rem; color:#fff; text-decoration:none; white-space:nowrap; }
+    .logo span { background:var(--red); color:#fff; padding:.1rem .4rem; border-radius:6px; font-size:.85rem; }
+    form.search { display:flex; flex:1; max-width:420px; }
+    form.search input { flex:1; background:#121212; border:1px solid var(--border); border-right:none; border-radius:20px 0 0 20px; padding:.4rem .85rem; color:#fff; font-size:.88rem; outline:none; }
+    form.search button { background:var(--hover); border:1px solid var(--border); border-radius:0 20px 20px 0; padding:.4rem .9rem; color:#fff; cursor:pointer; font-weight:600; font-size:.85rem; }
+    .nav-btn { background:var(--surf); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:.4rem .7rem; font-size:.82rem; text-decoration:none; cursor:pointer; font-weight:600; white-space:nowrap; }
+    .nav-btn:hover { background:var(--hover); }
+    .stage { height:calc(100vh - 56px); display:flex; align-items:center; justify-content:center; gap:1rem; padding:12px; position:relative; }
+    .reel { position:relative; height:100%; max-height:860px; aspect-ratio:9/16; max-width:100%; background:#000; border-radius:16px; overflow:hidden; box-shadow:0 16px 48px rgba(0,0,0,.7); border:1px solid var(--border); display:grid; place-items:center; }
+    .reel video, .reel iframe { width:100%; height:100%; object-fit:cover; display:block; border:none; }
+    .overlay { position:absolute; left:0; right:0; bottom:0; padding:1rem; background:linear-gradient(transparent, rgba(0,0,0,.85)); pointer-events:none; }
+    .overlay .stitle { font-weight:700; font-size:.95rem; line-height:1.3; margin-bottom:.25rem; text-shadow:0 1px 3px rgba(0,0,0,.8); }
+    .overlay .smeta { font-size:.8rem; color:#ddd; }
+    .controls { display:flex; flex-direction:column; gap:.65rem; align-items:center; }
+    .ctrl-btn { width:46px; height:46px; border-radius:50%; background:var(--surf); border:1px solid var(--border); color:#fff; font-size:1.15rem; cursor:pointer; display:grid; place-items:center; transition:background .12s,transform .12s; }
+    .ctrl-btn:hover { background:var(--hover); transform:scale(1.06); }
+    .counter { font-size:.76rem; color:var(--muted); }
+    @media (max-width:640px) { .controls { position:fixed; right:10px; bottom:90px; z-index:10; } .stage { padding:6px; } }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="logo" href="/shorts"><span>⚡</span> Shorts</a>
+    <form class="search" id="sh-search">
+      <input type="text" id="sq" value="${safeQ}" placeholder="Filter Shorts topic (e.g. chess, gaming)…">
+      <button type="submit">Go</button>
+    </form>
+    <a class="nav-btn" href="/yt">▶ YouTube</a>
+    <a class="nav-btn" href="/">🌐 Proxy</a>
+  </header>
+  <div class="stage" id="stage">
+    <div class="reel" id="reel">
+      <div id="status" style="color:#aaa;padding:1rem;text-align:center;">Loading Shorts…</div>
+    </div>
+    <div class="controls">
+      <button class="ctrl-btn" id="prev-btn" title="Previous Short (↑)">▲</button>
+      <div class="counter" id="counter">1 / 1</div>
+      <button class="ctrl-btn" id="next-btn" title="Next Short (↓)">▼</button>
+      <button class="ctrl-btn" id="mute-btn" title="Mute / Unmute (M)">🔊</button>
+      <a class="ctrl-btn" id="watch-link" href="/yt" title="Open in full Watch page" style="text-decoration:none;font-size:.9rem;">⛶</a>
+    </div>
+  </div>
+  <script>
+    (function () {
+      const PREFIX = ${JSON.stringify(PREFIX)};
+      const reel = document.getElementById('reel');
+      const counter = document.getElementById('counter');
+      const muteBtn = document.getElementById('mute-btn');
+      const watchLink = document.getElementById('watch-link');
+      const sq = document.getElementById('sq');
+
+      let queue = [];
+      let idx = 0;
+      let muted = false;
+      let wheelLock = false;
+      let touchStartY = 0;
+
+      function esc(s) {
+        return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      }
+
+      async function playAt(i) {
+        if (!queue.length) {
+          reel.innerHTML = '<div style="color:#aaa;padding:1rem;text-align:center;">No Shorts found. Try a different topic above.</div>';
+          return;
+        }
+        idx = ((i % queue.length) + queue.length) % queue.length;
+        const item = queue[idx];
+        counter.textContent = (idx + 1) + ' / ' + queue.length;
+        watchLink.href = '/watch?v=' + encodeURIComponent(item.id);
+        try { history.replaceState(null, '', '/shorts/' + encodeURIComponent(item.id)); } catch (e) {}
+
+        reel.innerHTML = '<div style="color:#aaa;padding:1rem;text-align:center;">Loading Short…</div>';
+
+        try {
+          const resp = await fetch('/yt/api/player?v=' + encodeURIComponent(item.id));
+          const p = await resp.json();
+          const title = p.title || item.title || 'YouTube Short';
+          const author = p.author || item.author || '';
+          document.title = title + ' — Shorts';
+
+          const src = (p.muxed && p.muxed[0] && p.muxed[0].url) || p.hlsUrl;
+          if (src) {
+            reel.innerHTML =
+              '<video id="svid" loop autoplay playsinline' + (muted ? ' muted' : '') + ' src="' + esc(src) + '"></video>' +
+              '<div class="overlay"><div class="stitle">' + esc(title) + '</div>' +
+              (author ? '<div class="smeta">' + esc(author) + '</div>' : '') + '</div>';
+            const v = document.getElementById('svid');
+            v.addEventListener('click', function () { v.paused ? v.play() : v.pause(); });
+            v.play().catch(function () { v.muted = true; muted = true; muteBtn.textContent = '🔇'; v.play().catch(function(){}); });
+          } else {
+            reel.innerHTML =
+              '<iframe src="' + PREFIX + 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(item.id) + '?autoplay=1&loop=1&playlist=' + encodeURIComponent(item.id) + '&raw=1" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+          }
+        } catch (e) {
+          reel.innerHTML = '<div style="color:#aaa;padding:1rem;text-align:center;">Could not load Short: ' + esc(e.message) + '</div>';
+        }
+      }
+
+      document.getElementById('prev-btn').addEventListener('click', function () { playAt(idx - 1); });
+      document.getElementById('next-btn').addEventListener('click', function () { playAt(idx + 1); });
+
+      muteBtn.addEventListener('click', function () {
+        muted = !muted;
+        muteBtn.textContent = muted ? '🔇' : '🔊';
+        const v = document.getElementById('svid');
+        if (v) v.muted = muted;
+      });
+
+      document.addEventListener('keydown', function (ev) {
+        if (ev.target && ev.target.tagName === 'INPUT') return;
+        if (ev.key === 'ArrowDown' || ev.key === 'j' || ev.key === 'J') { ev.preventDefault(); playAt(idx + 1); }
+        else if (ev.key === 'ArrowUp' || ev.key === 'k' || ev.key === 'K') { ev.preventDefault(); playAt(idx - 1); }
+        else if (ev.key === ' ') { ev.preventDefault(); const v = document.getElementById('svid'); if (v) v.paused ? v.play() : v.pause(); }
+        else if (ev.key === 'm' || ev.key === 'M') { muteBtn.click(); }
+      });
+
+      document.getElementById('stage').addEventListener('wheel', function (ev) {
+        if (wheelLock || Math.abs(ev.deltaY) < 25) return;
+        wheelLock = true;
+        setTimeout(function () { wheelLock = false; }, 450);
+        playAt(ev.deltaY > 0 ? idx + 1 : idx - 1);
+      }, { passive: true });
+
+      reel.addEventListener('touchstart', function (ev) { touchStartY = ev.touches[0].clientY; }, { passive: true });
+      reel.addEventListener('touchend', function (ev) {
+        const dy = touchStartY - ev.changedTouches[0].clientY;
+        if (Math.abs(dy) > 45) playAt(dy > 0 ? idx + 1 : idx - 1);
+      }, { passive: true });
+
+      document.getElementById('sh-search').addEventListener('submit', function (e) {
+        e.preventDefault();
+        window.location.href = '/shorts?q=' + encodeURIComponent(sq.value.trim());
+      });
+
+      (async function init() {
+        const initV = ${safeV};
+        const initQ = ${JSON.stringify(safeQ)};
+        try {
+          const resp = await fetch('/yt/api/shorts' + (initQ ? '?q=' + encodeURIComponent(initQ) : ''));
+          const data = await resp.json();
+          queue = data.videos || [];
+        } catch (e) {
+          queue = [];
+        }
+        if (initV) {
+          const existing = queue.findIndex(function (x) { return x.id === initV; });
+          if (existing !== -1) {
+            idx = existing;
+          } else {
+            queue.unshift({ id: initV, title: '' });
+            idx = 0;
+          }
+        }
+        playAt(idx);
+      })();
+    })();
+  </script>
+</body>
+</html>`,
+    { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=300' } }
   );
 }
 
@@ -860,6 +1106,7 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId, startSecond
       <input type="text" id="q" value="${safeQ}" placeholder="Search YouTube or paste a YouTube URL…">
       <button type="submit">Search</button>
     </form>
+    <a class="nav-btn" href="/shorts">⚡ Shorts</a>
     <a class="nav-btn" href="/">🌐 All-Sites Proxy</a>
     <a class="nav-btn" href="/__proxy_go?url=https%3A%2F%2Fwww.chess.com%2Fplay">♟ Chess.com</a>
   </header>
@@ -884,7 +1131,8 @@ function renderYouTubeShell(proxyBase, initialQuery, initialVideoId, startSecond
           return;
         }
         app.innerHTML = '<div class="grid">' + videos.map(function (v) {
-          return '<a class="card" href="/watch?v=' + encodeURIComponent(v.id) + '">' +
+          const href = v.isShort ? '/shorts/' + encodeURIComponent(v.id) : '/watch?v=' + encodeURIComponent(v.id);
+          return '<a class="card" href="' + href + '">' +
             '<div class="thumb-wrap"><img loading="lazy" src="' + thumbUrl(v.id) + '" alt="">' +
             (v.length ? '<span class="dur">' + esc(v.length) + '</span>' : '') + '</div>' +
             '<div class="meta"><div class="title">' + esc(v.title) + '</div>' +
@@ -1362,9 +1610,18 @@ export default {
       return renderYouTubeShell(proxyBase, url.searchParams.get('search_query') || '', '');
     }
 
-    if (url.pathname.startsWith('/shorts/')) {
+    if (url.pathname === '/shorts' || url.pathname.startsWith('/shorts/')) {
       const v = extractVideoId(url.pathname.split('/').filter(Boolean)[1] || '');
-      if (v) return renderYouTubeShell(proxyBase, '', v);
+      const q = url.searchParams.get('q') || '';
+      return renderYouTubeShorts(v || '', q);
+    }
+
+    if (url.pathname === '/yt/api/shorts') {
+      const q = url.searchParams.get('q') || '';
+      const videos = await fetchInnerTubeShorts(q);
+      return new Response(JSON.stringify({ videos }), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=120', ...corsHeaders(request) },
+      });
     }
 
     if (url.pathname === '/yt/api/search') {
@@ -1462,7 +1719,8 @@ export default {
       <button type="submit">Go</button>
     </form>
     <div class="quick">
-      <a class="btn yt" href="/yt">▶ YouTube (Fast Player)</a>
+      <a class="btn yt" href="/yt">▶ YouTube</a>
+      <a class="btn yt" href="/shorts">⚡ Shorts</a>
       <a class="btn" data-url="https://www.chess.com/play" href="/__proxy_go?url=https%3A%2F%2Fwww.chess.com%2Fplay">♟ Chess.com</a>
       <a class="btn" data-url="https://www.wikipedia.org" href="/__proxy_go?url=https%3A%2F%2Fwww.wikipedia.org">📚 Wikipedia</a>
     </div>
@@ -1481,8 +1739,11 @@ export default {
 
       async function go(raw) {
         var val = raw.trim();
-        var ytMatch = val.match(/(?:youtube\\.com\\/watch\\?[^#]*v=|youtu\\.be\\/|youtube\\.com\\/shorts\\/)([a-zA-Z0-9_-]{11})/i);
-        if (ytMatch) { window.location.href = '/yt/watch?v=' + ytMatch[1]; return; }
+        var shMatch = val.match(/youtube\\.com\\/shorts\\/([a-zA-Z0-9_-]{11})/i);
+        if (shMatch) { window.location.href = '/shorts/' + shMatch[1]; return; }
+        if (/^(?:https?:\\/\\/)?(?:www\\.|m\\.)?youtube\\.com\\/shorts\\/?$/i.test(val)) { window.location.href = '/shorts'; return; }
+        var ytMatch = val.match(/(?:youtube\\.com\\/watch\\?[^#]*v=|youtu\\.be\\/)([a-zA-Z0-9_-]{11})/i);
+        if (ytMatch) { window.location.href = '/watch?v=' + ytMatch[1]; return; }
         if (/^(?:https?:\\/\\/)?(?:www\\.|m\\.)?youtube\\.com\\/?$/i.test(val)) { window.location.href = '/yt'; return; }
         await swReady;
         if (!/^https?:\\/\\//i.test(val)) val = 'https://' + val;
@@ -1523,6 +1784,7 @@ export default {
       const ytRoute = matchYouTubePageRoute(fetchUrl);
       if (ytRoute) {
         if (ytRoute.type === 'embed') return renderYouTubeEmbed(ytRoute.videoId, ytRoute.startSeconds);
+        if (ytRoute.type === 'shorts') return renderYouTubeShorts(ytRoute.videoId, '');
         if (ytRoute.type === 'watch') return renderYouTubeShell(proxyBase, '', ytRoute.videoId, ytRoute.startSeconds);
         if (ytRoute.type === 'search') return renderYouTubeShell(proxyBase, ytRoute.query, '');
         if (ytRoute.type === 'home') return renderYouTubeShell(proxyBase, '', '');

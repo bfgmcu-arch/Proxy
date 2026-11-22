@@ -1,26 +1,257 @@
-import {
-  PREFIX,
-  HEALTH_PATH,
-  RUNTIME_PATH,
-  SW_PATH,
-  CLIENT_RUNTIME_SCRIPT,
-  SERVICE_WORKER_SCRIPT,
-  isStreamingMediaUrl,
-  isCookieFreeCdn,
-  isStaticAssetUrl,
-  resolveIncomingTargetUrl,
-  extractProxiedTarget,
-  rewriteUrl,
-  rewriteSrcset,
-  rewriteHtml,
-  rewriteCss,
-  rewriteSetCookie,
-  computeUpstreamOrigin,
-  stripInternalParams,
-} from './rewriter.js';
+/**
+ * Self-contained Cloudflare Workers Web Proxy + Built-in Native YouTube Engine
+ * Optimized for Cloudflare Workers Free Tier (10ms CPU, 128MB RAM, 100k req/day).
+ * Zero external dependencies or local imports — works with `wrangler deploy`,
+ * Cloudflare Git Builds, AND Cloudflare Dashboard Quick Edit copy-paste.
+ */
+
+export const PREFIX = '/-----';
+export const RUNTIME_PATH = '/__proxy_runtime.js';
+export const SW_PATH = '/__proxy_sw.js';
+export const HEALTH_PATH = '/__proxy_health';
 
 const MAX_CSS_REWRITE_BYTES = 1_500_000;
 const STATIC_CACHE_CONTROL = 'public, max-age=86400, stale-while-revalidate=604800';
+const SKIP_PROTOCOLS = /^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
+const STATIC_EXT_RE =
+  /\.(?:js|mjs|css|wasm|png|jpe?g|webp|gif|svg|ico|woff2?|ttf|otf|eot|mp3|ogg|wav|webm|avif)(?:$|\?)/i;
+const COOKIE_FREE_CDNS = ['chesscomfiles.com', 'ytimg.com', 'ggpht.com', 'fonts.gstatic.com'];
+
+// ============================================================================
+// URL, Asset, Cookie, CSS, and M3U8 Rewriting Helpers
+// ============================================================================
+
+export function isStreamingMediaUrl(targetUrl) {
+  const host = targetUrl.hostname.toLowerCase();
+  if (host === 'googlevideo.com' || host.endsWith('.googlevideo.com')) return true;
+  const p = targetUrl.pathname.toLowerCase();
+  return p.includes('/videoplayback') || /\.(?:m3u8|mpd|m4s|ts)(?:$|\?)/.test(p);
+}
+
+export function isCookieFreeCdn(hostname) {
+  if (!hostname) return false;
+  const h = hostname.toLowerCase();
+  for (let i = 0; i < COOKIE_FREE_CDNS.length; i++) {
+    const cdn = COOKIE_FREE_CDNS[i];
+    if (h === cdn || h.endsWith('.' + cdn)) return true;
+  }
+  return false;
+}
+
+export function isStaticAssetUrl(targetUrl) {
+  if (isStreamingMediaUrl(targetUrl)) return false;
+  const host = targetUrl.hostname.toLowerCase();
+  if (isCookieFreeCdn(host)) return true;
+  if (
+    (host === 'www.youtube.com' || host === 'm.youtube.com') &&
+    (targetUrl.pathname.startsWith('/s/player/') || targetUrl.pathname.startsWith('/s/desktop/'))
+  ) {
+    return true;
+  }
+  return STATIC_EXT_RE.test(targetUrl.pathname);
+}
+
+export function normalizeTargetUrl(raw) {
+  if (!raw) return '';
+  return raw.replace(/^(https?|wss?):\/(?!\/)/i, '$1://');
+}
+
+function stripProxyPrefix(pathname) {
+  if (pathname.startsWith(PREFIX)) return pathname.substring(PREFIX.length);
+  return pathname.substring(1);
+}
+
+export function extractProxiedTarget(proxiedUrlStr) {
+  try {
+    const parsed = new URL(proxiedUrlStr);
+    const raw = normalizeTargetUrl(stripProxyPrefix(parsed.pathname) + parsed.search);
+    if (/^(https?|wss?):\/\//i.test(raw)) return new URL(raw);
+    if (parsed.pathname === '/' && parsed.searchParams.has('url')) {
+      return new URL(normalizeTargetUrl(parsed.searchParams.get('url')));
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+export function resolveIncomingTargetUrl(requestUrl, refererHeader) {
+  let targetUrlStr = '';
+  if (requestUrl.pathname === '/' && requestUrl.searchParams.has('url')) {
+    targetUrlStr = normalizeTargetUrl(requestUrl.searchParams.get('url') || '');
+  } else {
+    targetUrlStr = normalizeTargetUrl(stripProxyPrefix(requestUrl.pathname) + requestUrl.search);
+  }
+
+  if (!targetUrlStr) return { error: 'Invalid URL', status: 400 };
+
+  if (/^(https?|wss?):\/\//i.test(targetUrlStr)) {
+    try {
+      return { targetUrl: new URL(targetUrlStr) };
+    } catch {
+      return { error: 'Invalid URL: ' + targetUrlStr, status: 400 };
+    }
+  }
+
+  if (refererHeader) {
+    const baseTargetUrl = extractProxiedTarget(refererHeader);
+    if (baseTargetUrl) {
+      try {
+        return { targetUrl: new URL(requestUrl.pathname + requestUrl.search, baseTargetUrl.href) };
+      } catch {
+        return { error: 'Invalid URL or unable to resolve relative path', status: 400 };
+      }
+    }
+  }
+
+  return { error: 'Invalid URL: ' + targetUrlStr, status: 400 };
+}
+
+export function rewriteUrl(rawUrl, baseUrl, proxyBase) {
+  if (!rawUrl) return rawUrl;
+  const trimmed = rawUrl.trim();
+  if (!trimmed || SKIP_PROTOCOLS.test(trimmed)) return rawUrl;
+  if (
+    trimmed.startsWith(proxyBase + PREFIX) ||
+    trimmed.startsWith(PREFIX) ||
+    trimmed.startsWith(proxyBase + '/http') ||
+    trimmed.startsWith(proxyBase + '/ws') ||
+    /^\/(https?|wss?):\/\//i.test(trimmed)
+  ) {
+    return rawUrl;
+  }
+
+  try {
+    const resolved = new URL(trimmed, baseUrl);
+    if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
+      return `${proxyBase}${PREFIX}${resolved.href}`;
+    }
+    if (resolved.protocol === 'ws:' || resolved.protocol === 'wss:') {
+      return `${proxyBase.replace(/^http/i, 'ws')}${PREFIX}${resolved.href}`;
+    }
+  } catch {
+    // ignore
+  }
+  return rawUrl;
+}
+
+export function rewriteSrcset(srcset, baseUrl, proxyBase) {
+  if (!srcset) return srcset;
+  return srcset
+    .split(',')
+    .map((part) => {
+      const trimmed = part.trim();
+      if (!trimmed) return part;
+      const spaceIdx = trimmed.search(/\s/);
+      if (spaceIdx === -1) return rewriteUrl(trimmed, baseUrl, proxyBase);
+      return rewriteUrl(trimmed.slice(0, spaceIdx), baseUrl, proxyBase) + trimmed.slice(spaceIdx);
+    })
+    .join(', ');
+}
+
+export function rewriteCss(css, baseUrl, proxyBase) {
+  if (!css) return css;
+  const hasUrl = css.indexOf('url(') !== -1 || css.indexOf('URL(') !== -1;
+  const hasImport = css.indexOf('@import') !== -1 || css.indexOf('@IMPORT') !== -1;
+  if (!hasUrl && !hasImport) return css;
+
+  let out = css;
+  if (hasUrl) {
+    out = out.replace(/url\(\s*(['"]?)([^)'"]+)\1\s*\)/gi, (match, quote, urlVal) => {
+      return `url(${quote}${rewriteUrl(urlVal, baseUrl, proxyBase)}${quote})`;
+    });
+  }
+  if (hasImport) {
+    out = out.replace(/@import\s+(['"])([^'"]+)\1/gi, (match, quote, urlVal) => {
+      return `@import ${quote}${rewriteUrl(urlVal, baseUrl, proxyBase)}${quote}`;
+    });
+  }
+  return out;
+}
+
+/**
+ * Rewrite HLS (.m3u8) playlist URLs so YouTube HD HLS streams play through the Worker.
+ */
+export function rewriteM3u8(manifest, baseUrl, proxyBase) {
+  if (!manifest) return manifest;
+  return manifest
+    .split('\n')
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return line;
+      if (trimmed.startsWith('#')) {
+        return line.replace(/URI="([^"]+)"/gi, (m, uri) => `URI="${rewriteUrl(uri, baseUrl, proxyBase)}"`);
+      }
+      return rewriteUrl(trimmed, baseUrl, proxyBase);
+    })
+    .join('\n');
+}
+
+export function rewriteSetCookie(cookieHeader, isHttpsProxy) {
+  if (!cookieHeader) return cookieHeader;
+  const parts = cookieHeader.split(';').map((p) => p.trim()).filter(Boolean);
+  if (parts.length === 0) return cookieHeader;
+
+  const nameValue = parts[0];
+  const attrs = [];
+  let hasSameSite = false;
+  let hasSecure = false;
+  let hasPath = false;
+
+  for (let i = 1; i < parts.length; i++) {
+    const attr = parts[i];
+    const lower = attr.toLowerCase();
+    if (lower.startsWith('domain=')) continue;
+    if (lower.startsWith('path=')) {
+      attrs.push('Path=/');
+      hasPath = true;
+      continue;
+    }
+    if (lower.startsWith('samesite=')) {
+      hasSameSite = true;
+      attrs.push(isHttpsProxy ? 'SameSite=None' : 'SameSite=Lax');
+      continue;
+    }
+    if (lower === 'secure') {
+      hasSecure = true;
+      if (isHttpsProxy) attrs.push('Secure');
+      continue;
+    }
+    if (lower === 'partitioned' && !isHttpsProxy) continue;
+    attrs.push(attr);
+  }
+
+  if (!hasPath) attrs.push('Path=/');
+  if (isHttpsProxy) {
+    if (!hasSameSite) attrs.push('SameSite=None');
+    if (!hasSecure) attrs.push('Secure');
+  }
+  return [nameValue, ...attrs].join('; ');
+}
+
+export function computeUpstreamOrigin(targetUrl, refererHeader, explicitProxyOrigin) {
+  if (explicitProxyOrigin) {
+    try {
+      return new URL(explicitProxyOrigin).origin;
+    } catch {
+      // fall through
+    }
+  }
+  if (refererHeader) {
+    const refTarget = extractProxiedTarget(refererHeader);
+    if (refTarget) return refTarget.origin;
+  }
+  return targetUrl.origin;
+}
+
+export function stripInternalParams(targetUrl) {
+  const cleaned = new URL(targetUrl.href);
+  const explicitOrigin = cleaned.searchParams.get('__proxy_origin');
+  if (cleaned.searchParams.has('__proxy_origin')) {
+    cleaned.searchParams.delete('__proxy_origin');
+  }
+  return { cleanedUrl: cleaned, explicitOrigin };
+}
 
 function corsHeaders(request) {
   const reqOrigin = request.headers.get('Origin');
@@ -35,10 +266,659 @@ function corsHeaders(request) {
   };
 }
 
+// ============================================================================
+// Built-in Native YouTube InnerTube Engine (/yt)
+// ============================================================================
+
+export function extractVideoId(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+  if (/^[a-zA-Z0-9_-]{11}$/.test(s)) return s;
+  try {
+    const u = new URL(/^https?:\/\//i.test(s) ? s : 'https://' + s);
+    const h = u.hostname.toLowerCase();
+    if (h === 'youtu.be') {
+      const id = u.pathname.split('/').filter(Boolean)[0];
+      if (id && /^[a-zA-Z0-9_-]{11}$/.test(id)) return id;
+    }
+    if (h === 'youtube.com' || h.endsWith('.youtube.com')) {
+      const v = u.searchParams.get('v');
+      if (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) return v;
+      const parts = u.pathname.split('/').filter(Boolean);
+      if ((parts[0] === 'shorts' || parts[0] === 'embed' || parts[0] === 'live') && parts[1]) {
+        if (/^[a-zA-Z0-9_-]{11}$/.test(parts[1])) return parts[1];
+      }
+    }
+  } catch {
+    // ignore
+  }
+  return null;
+}
+
+function ytText(obj) {
+  if (!obj) return '';
+  if (typeof obj.simpleText === 'string') return obj.simpleText;
+  if (Array.isArray(obj.runs)) return obj.runs.map((r) => r.text || '').join('');
+  return '';
+}
+
 /**
- * Rewrite an HTML Response using Cloudflare's native Rust streaming HTMLRewriter.
- * Uses <1ms CPU and near-zero memory (stays well within the 10ms Free Tier limit).
+ * Recursively collect videoRenderer / compactVideoRenderer items from YouTube InnerTube JSON.
  */
+export function parseSearchVideos(data, limit = 30) {
+  const results = [];
+  const seen = new Set();
+
+  function walk(node) {
+    if (!node || typeof node !== 'object' || results.length >= limit) return;
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length && results.length < limit; i++) walk(node[i]);
+      return;
+    }
+    const vr = node.videoRenderer || node.compactVideoRenderer || node.gridVideoRenderer;
+    if (vr && vr.videoId && !seen.has(vr.videoId)) {
+      seen.add(vr.videoId);
+      results.push({
+        id: vr.videoId,
+        title: ytText(vr.title),
+        author: ytText(vr.ownerText || vr.longBylineText || vr.shortBylineText),
+        views: ytText(vr.shortViewCountText || vr.viewCountText),
+        length: ytText(vr.lengthText),
+        published: ytText(vr.publishedTimeText),
+      });
+      return;
+    }
+    for (const key of Object.keys(node)) {
+      if (results.length >= limit) break;
+      walk(node[key]);
+    }
+  }
+
+  walk(data);
+  return results;
+}
+
+/**
+ * Extract directly playable streams (muxed MP4, HLS manifest, audio-only) from InnerTube player JSON.
+ */
+export function extractPlayableStreams(playerJson, proxyBase) {
+  const sd = playerJson?.streamingData || {};
+  const vd = playerJson?.videoDetails || {};
+  const status = playerJson?.playabilityStatus?.status || 'UNKNOWN';
+  const reason = playerJson?.playabilityStatus?.reason || '';
+
+  const muxed = (sd.formats || [])
+    .filter((f) => typeof f.url === 'string' && f.url.length > 0)
+    .map((f) => ({
+      itag: f.itag,
+      quality: f.qualityLabel || `${f.height || ''}p`,
+      mimeType: f.mimeType || 'video/mp4',
+      url: `${proxyBase}${PREFIX}${f.url}`,
+    }));
+
+  const audio = (sd.adaptiveFormats || [])
+    .filter((f) => typeof f.url === 'string' && (f.mimeType || '').startsWith('audio/'))
+    .map((f) => ({
+      itag: f.itag,
+      bitrate: f.bitrate || 0,
+      mimeType: f.mimeType,
+      url: `${proxyBase}${PREFIX}${f.url}`,
+    }))
+    .sort((a, b) => b.bitrate - a.bitrate);
+
+  const hlsUrl = sd.hlsManifestUrl ? `${proxyBase}${PREFIX}${sd.hlsManifestUrl}` : null;
+
+  return {
+    status,
+    reason,
+    videoId: vd.videoId || '',
+    title: vd.title || '',
+    author: vd.author || '',
+    views: vd.viewCount || '',
+    lengthSeconds: Number(vd.lengthSeconds || 0),
+    description: vd.shortDescription || '',
+    muxed,
+    audio,
+    hlsUrl,
+  };
+}
+
+const INNERTUBE_CLIENTS = [
+  {
+    name: 'IOS',
+    userAgent: 'com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)',
+    clientHeader: '5',
+    versionHeader: '19.29.1',
+    body: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'IOS',
+          clientVersion: '19.29.1',
+          deviceMake: 'Apple',
+          deviceModel: 'iPhone16,2',
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+    }),
+  },
+  {
+    name: 'ANDROID',
+    userAgent: 'com.google.android.youtube/19.29.37 (Linux; U; Android 14) gzip',
+    clientHeader: '3',
+    versionHeader: '19.29.37',
+    body: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'ANDROID',
+          clientVersion: '19.29.37',
+          androidSdkVersion: 34,
+          hl: 'en',
+          gl: 'US',
+        },
+      },
+    }),
+  },
+  {
+    name: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+    userAgent:
+      'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version',
+    clientHeader: '85',
+    versionHeader: '2.0',
+    body: (videoId) => ({
+      videoId,
+      context: {
+        client: {
+          clientName: 'TVHTML5_SIMPLY_EMBEDDED_PLAYER',
+          clientVersion: '2.0',
+          hl: 'en',
+          gl: 'US',
+        },
+        thirdParty: { embedUrl: 'https://www.youtube.com/' },
+      },
+    }),
+  },
+];
+
+async function fetchInnerTubePlayer(videoId, proxyBase) {
+  let lastResult = null;
+  for (const client of INNERTUBE_CLIENTS) {
+    try {
+      const resp = await fetch('https://www.youtube.com/youtubei/v1/player?prettyPrint=false', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': client.userAgent,
+          'X-YouTube-Client-Name': client.clientHeader,
+          'X-YouTube-Client-Version': client.versionHeader,
+          Origin: 'https://www.youtube.com',
+          Referer: 'https://www.youtube.com/',
+          Cookie: 'CONSENT=YES+cb',
+        },
+        body: JSON.stringify(client.body(videoId)),
+      });
+      if (!resp.ok) continue;
+      const json = await resp.json();
+      const parsed = extractPlayableStreams(json, proxyBase);
+      lastResult = { ...parsed, client: client.name };
+      if (parsed.status === 'OK' && (parsed.muxed.length > 0 || parsed.hlsUrl)) {
+        return lastResult;
+      }
+    } catch {
+      // try next client
+    }
+  }
+  return (
+    lastResult || {
+      status: 'ERROR',
+      reason: 'Could not extract streams from YouTube InnerTube',
+      videoId,
+      muxed: [],
+      audio: [],
+      hlsUrl: null,
+    }
+  );
+}
+
+async function fetchInnerTubeSearch(query) {
+  const endpoint = query
+    ? 'https://www.youtube.com/youtubei/v1/search?prettyPrint=false'
+    : 'https://www.youtube.com/youtubei/v1/browse?prettyPrint=false';
+
+  const payload = query
+    ? {
+        query,
+        context: { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: 'en', gl: 'US' } },
+      }
+    : {
+        browseId: 'FEwhat_to_watch',
+        context: { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: 'en', gl: 'US' } },
+      };
+
+  const resp = await fetch(endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'User-Agent':
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      Origin: 'https://www.youtube.com',
+      Referer: 'https://www.youtube.com/',
+      Cookie: 'CONSENT=YES+cb',
+    },
+    body: JSON.stringify(payload),
+  });
+  if (!resp.ok) return [];
+  const data = await resp.json();
+  return parseSearchVideos(data, 30);
+}
+
+async function fetchInnerTubeRelated(videoId) {
+  try {
+    const resp = await fetch('https://www.youtube.com/youtubei/v1/next?prettyPrint=false', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'User-Agent':
+          'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        Origin: 'https://www.youtube.com',
+        Referer: 'https://www.youtube.com/',
+        Cookie: 'CONSENT=YES+cb',
+      },
+      body: JSON.stringify({
+        videoId,
+        context: { client: { clientName: 'WEB', clientVersion: '2.20250101.00.00', hl: 'en', gl: 'US' } },
+      }),
+    });
+    if (!resp.ok) return [];
+    const data = await resp.json();
+    return parseSearchVideos(data, 16);
+  } catch {
+    return [];
+  }
+}
+
+function escapeHtml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderYouTubeShell(proxyBase, initialQuery, initialVideoId) {
+  const safeQ = escapeHtml(initialQuery || '');
+  const safeV = escapeHtml(initialVideoId || '');
+  return new Response(
+    `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>YouTube — Cloudflare Proxy</title>
+  <style>
+    :root { --bg:#0f0f0f; --surf:#1c1c1c; --hover:#272727; --border:#303030; --text:#f1f1f1; --muted:#aaa; --red:#ff0033; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:system-ui,-apple-system,Roboto,sans-serif; }
+    header { position:sticky; top:0; z-index:20; display:flex; align-items:center; gap:.75rem; padding:.6rem 1rem; background:rgba(15,15,15,.95); backdrop-filter:blur(8px); border-bottom:1px solid var(--border); flex-wrap:wrap; }
+    .logo { display:flex; align-items:center; gap:.4rem; font-weight:800; font-size:1.1rem; color:#fff; text-decoration:none; }
+    .logo span { background:var(--red); color:#fff; padding:.1rem .45rem; border-radius:6px; font-size:.9rem; }
+    form.search { display:flex; flex:1; max-width:600px; min-width:200px; }
+    form.search input { flex:1; background:#121212; border:1px solid var(--border); border-right:none; border-radius:20px 0 0 20px; padding:.5rem 1rem; color:#fff; font-size:.95rem; outline:none; }
+    form.search input:focus { border-color:#3ea6ff; }
+    form.search button { background:var(--hover); border:1px solid var(--border); border-radius:0 20px 20px 0; padding:.5rem 1.1rem; color:#fff; cursor:pointer; font-weight:600; }
+    .nav-btn { background:var(--surf); border:1px solid var(--border); color:var(--text); border-radius:8px; padding:.45rem .75rem; font-size:.84rem; text-decoration:none; cursor:pointer; font-weight:600; }
+    .nav-btn:hover { background:var(--hover); }
+    main { max-width:1400px; margin:0 auto; padding:1rem; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(270px,1fr)); gap:1.1rem; }
+    .card { display:flex; flex-direction:column; text-decoration:none; color:inherit; background:var(--surf); border-radius:12px; overflow:hidden; border:1px solid transparent; transition:transform .12s,border-color .12s; }
+    .card:hover { transform:translateY(-2px); border-color:var(--border); }
+    .thumb-wrap { position:relative; aspect-ratio:16/9; background:#000; }
+    .thumb-wrap img { width:100%; height:100%; object-fit:cover; display:block; }
+    .dur { position:absolute; right:6px; bottom:6px; background:rgba(0,0,0,.85); color:#fff; font-size:.74rem; font-weight:700; padding:2px 5px; border-radius:4px; }
+    .meta { padding:.65rem .75rem; }
+    .title { font-weight:600; font-size:.92rem; line-height:1.35; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; margin-bottom:.35rem; }
+    .sub { color:var(--muted); font-size:.8rem; }
+    .watch-layout { display:grid; grid-template-columns:1fr 360px; gap:1.25rem; }
+    @media (max-width:960px) { .watch-layout { grid-template-columns:1fr; } }
+    .player-box { width:100%; aspect-ratio:16/9; background:#000; border-radius:12px; overflow:hidden; }
+    .player-box video, .player-box iframe { width:100%; height:100%; display:block; border:none; }
+    .watch-bar { display:flex; align-items:center; justify-content:space-between; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; }
+    .watch-bar select { background:var(--surf); color:#fff; border:1px solid var(--border); border-radius:8px; padding:.4rem .65rem; font-size:.85rem; }
+    .watch-title { margin:.75rem 0 .25rem; font-size:1.25rem; }
+    .watch-author { color:var(--muted); font-size:.9rem; margin-bottom:.75rem; }
+    .desc { background:var(--surf); border-radius:10px; padding:.85rem; font-size:.86rem; color:#ddd; white-space:pre-wrap; max-height:180px; overflow-y:auto; }
+    .related { display:flex; flex-direction:column; gap:.75rem; }
+    .rel-card { display:flex; gap:.6rem; text-decoration:none; color:inherit; }
+    .rel-card .thumb-wrap { width:150px; flex-shrink:0; border-radius:8px; overflow:hidden; }
+    .status { text-align:center; padding:2.5rem 1rem; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <a class="logo" href="/yt"><span>▶</span> YouTube</a>
+    <form class="search" id="yt-search">
+      <input type="text" id="q" value="${safeQ}" placeholder="Search YouTube or paste a YouTube URL…">
+      <button type="submit">Search</button>
+    </form>
+    <a class="nav-btn" href="/">🌐 All-Sites Proxy</a>
+    <a class="nav-btn" href="/__proxy_go?url=https%3A%2F%2Fwww.chess.com%2Fplay">♟ Chess.com</a>
+  </header>
+  <main id="app"><div class="status">Loading…</div></main>
+  <script>
+    (function () {
+      const PREFIX = ${JSON.stringify(PREFIX)};
+      const app = document.getElementById('app');
+      const qInput = document.getElementById('q');
+
+      function esc(s) {
+        return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+      }
+
+      function thumbUrl(id) {
+        return PREFIX + 'https://i.ytimg.com/vi/' + encodeURIComponent(id) + '/hqdefault.jpg';
+      }
+
+      function renderGrid(videos) {
+        if (!videos || !videos.length) {
+          app.innerHTML = '<div class="status">No videos found. Try searching for a topic or pasting a YouTube video URL.</div>';
+          return;
+        }
+        app.innerHTML = '<div class="grid">' + videos.map(function (v) {
+          return '<a class="card" href="/yt/watch?v=' + encodeURIComponent(v.id) + '">' +
+            '<div class="thumb-wrap"><img loading="lazy" src="' + thumbUrl(v.id) + '" alt="">' +
+            (v.length ? '<span class="dur">' + esc(v.length) + '</span>' : '') + '</div>' +
+            '<div class="meta"><div class="title">' + esc(v.title) + '</div>' +
+            '<div class="sub">' + esc(v.author) + (v.views ? ' • ' + esc(v.views) : '') + (v.published ? ' • ' + esc(v.published) : '') + '</div></div></a>';
+        }).join('') + '</div>';
+      }
+
+      async function loadSearch(q) {
+        app.innerHTML = '<div class="status">Loading YouTube' + (q ? ' search for "' + esc(q) + '"' : ' home feed') + '…</div>';
+        try {
+          const resp = await fetch('/yt/api/search' + (q ? '?q=' + encodeURIComponent(q) : ''));
+          const data = await resp.json();
+          renderGrid(data.videos || []);
+        } catch (e) {
+          app.innerHTML = '<div class="status">Failed to load YouTube feed: ' + esc(e.message) + '</div>';
+        }
+      }
+
+      async function loadWatch(videoId) {
+        app.innerHTML = '<div class="status">Resolving video streams via Cloudflare Worker…</div>';
+        try {
+          const [playerResp, relResp] = await Promise.all([
+            fetch('/yt/api/player?v=' + encodeURIComponent(videoId)),
+            fetch('/yt/api/related?v=' + encodeURIComponent(videoId))
+          ]);
+          const p = await playerResp.json();
+          const rel = await relResp.json();
+
+          const streams = [];
+          (p.muxed || []).forEach(function (m) {
+            streams.push({ label: (m.quality || 'MP4') + ' (Direct MP4)', url: m.url, type: 'video' });
+          });
+          if (p.hlsUrl) {
+            streams.push({ label: 'Auto HD (HLS)', url: p.hlsUrl, type: 'hls' });
+          }
+          if (p.audio && p.audio.length) {
+            streams.push({ label: 'Audio Only', url: p.audio[0].url, type: 'audio' });
+          }
+
+          let playerHtml = '';
+          if (streams.length > 0) {
+            playerHtml = '<video id="vid" controls autoplay playsinline src="' + esc(streams[0].url) + '"></video>';
+          } else {
+            playerHtml = '<iframe src="' + PREFIX + 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(videoId) + '?autoplay=1" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+          }
+
+          const optionsHtml = streams.map(function (s, i) {
+            return '<option value="' + i + '">' + esc(s.label) + '</option>';
+          }).join('');
+
+          const relHtml = (rel.videos || []).map(function (v) {
+            return '<a class="rel-card" href="/yt/watch?v=' + encodeURIComponent(v.id) + '">' +
+              '<div class="thumb-wrap"><img loading="lazy" src="' + thumbUrl(v.id) + '" alt="">' +
+              (v.length ? '<span class="dur">' + esc(v.length) + '</span>' : '') + '</div>' +
+              '<div><div class="title">' + esc(v.title) + '</div><div class="sub">' + esc(v.author) + (v.views ? ' • ' + esc(v.views) : '') + '</div></div></a>';
+          }).join('');
+
+          app.innerHTML =
+            '<div class="watch-layout"><div>' +
+            '<div class="player-box" id="player-box">' + playerHtml + '</div>' +
+            '<div class="watch-bar">' +
+              (streams.length ? '<select id="q-sel">' + optionsHtml + '</select>' : '<span class="sub">Using YouTube Embed Player</span>') +
+              '<div style="display:flex;gap:.4rem;flex-wrap:wrap;">' +
+                '<button class="nav-btn" id="embed-btn">Embed Player</button>' +
+                '<a class="nav-btn" href="/__proxy_go?url=' + encodeURIComponent('https://www.youtube.com/watch?v=' + videoId) + '">Raw YouTube</a>' +
+              '</div>' +
+            '</div>' +
+            '<h1 class="watch-title">' + esc(p.title || 'YouTube Video') + '</h1>' +
+            '<div class="watch-author">' + esc(p.author || '') + (p.views ? ' • ' + Number(p.views).toLocaleString() + ' views' : '') + (p.client ? ' • via ' + esc(p.client) : '') + '</div>' +
+            (p.description ? '<div class="desc">' + esc(p.description) + '</div>' : '') +
+            '</div><aside class="related">' + relHtml + '</aside></div>';
+
+          const sel = document.getElementById('q-sel');
+          if (sel) {
+            sel.addEventListener('change', function () {
+              const s = streams[Number(sel.value)];
+              const box = document.getElementById('player-box');
+              const cur = document.getElementById('vid');
+              const t = cur ? cur.currentTime : 0;
+              box.innerHTML = '<video id="vid" controls autoplay playsinline src="' + esc(s.url) + '"></video>';
+              const nv = document.getElementById('vid');
+              nv.addEventListener('loadedmetadata', function () { if (t > 0) nv.currentTime = t; }, { once: true });
+            });
+          }
+
+          document.getElementById('embed-btn').addEventListener('click', function () {
+            document.getElementById('player-box').innerHTML =
+              '<iframe src="' + PREFIX + 'https://www.youtube-nocookie.com/embed/' + encodeURIComponent(videoId) + '?autoplay=1" allow="autoplay; fullscreen; encrypted-media; picture-in-picture" allowfullscreen></iframe>';
+          });
+        } catch (e) {
+          app.innerHTML = '<div class="status">Error loading video: ' + esc(e.message) + '</div>';
+        }
+      }
+
+      document.getElementById('yt-search').addEventListener('submit', function (e) {
+        e.preventDefault();
+        const val = qInput.value.trim();
+        if (!val) return;
+        const m = val.match(/(?:v=|youtu\\.be\\/|shorts\\/|embed\\/)([a-zA-Z0-9_-]{11})/);
+        if (m) {
+          window.location.href = '/yt/watch?v=' + encodeURIComponent(m[1]);
+        } else {
+          window.location.href = '/yt?q=' + encodeURIComponent(val);
+        }
+      });
+
+      const initV = ${JSON.stringify(safeV)};
+      const initQ = ${JSON.stringify(safeQ)};
+      if (initV) loadWatch(initV);
+      else loadSearch(initQ);
+    })();
+  </script>
+</body>
+</html>`,
+    {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'public, max-age=300',
+      },
+    }
+  );
+}
+
+// ============================================================================
+// Service Worker & Client Runtime Scripts (for All-Websites Proxy)
+// ============================================================================
+
+export const SERVICE_WORKER_SCRIPT = `const PREFIX = '${PREFIX}';
+
+self.addEventListener('install', () => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+function extractTargetFromClientUrl(clientUrl) {
+  try {
+    const u = new URL(clientUrl);
+    let raw = u.pathname.startsWith(PREFIX)
+      ? u.pathname.substring(PREFIX.length) + u.search
+      : u.pathname.substring(1) + u.search;
+    raw = raw.replace(/^(https?|wss?):\\/(?!\\/)/i, '$1://');
+    if (/^https?:\\/\\//i.test(raw)) return new URL(raw);
+  } catch (e) {}
+  return null;
+}
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  let reqUrl;
+  try {
+    reqUrl = new URL(req.url);
+  } catch (e) {
+    return;
+  }
+
+  if (reqUrl.protocol !== 'http:' && reqUrl.protocol !== 'https:') return;
+
+  const isSameOrigin = reqUrl.origin === self.location.origin;
+  if (isSameOrigin) {
+    const p = reqUrl.pathname;
+    if (
+      p === '/' ||
+      p === '/yt' ||
+      p.startsWith('/yt/') ||
+      p.startsWith('/__proxy_') ||
+      p.startsWith(PREFIX) ||
+      /^\\/(https?|wss?):\\/\\//i.test(p)
+    ) {
+      return;
+    }
+  }
+
+  event.respondWith((async () => {
+    let targetHref = null;
+    if (!isSameOrigin) {
+      targetHref = reqUrl.href;
+    } else {
+      let client = null;
+      if (event.clientId) client = await self.clients.get(event.clientId);
+      if (!client && event.resultingClientId) client = await self.clients.get(event.resultingClientId);
+      if (client) {
+        const baseTarget = extractTargetFromClientUrl(client.url);
+        if (baseTarget) targetHref = new URL(reqUrl.pathname + reqUrl.search, baseTarget.origin).href;
+      }
+      if (!targetHref && req.referrer) {
+        const refTarget = extractTargetFromClientUrl(req.referrer);
+        if (refTarget) targetHref = new URL(reqUrl.pathname + reqUrl.search, refTarget.origin).href;
+      }
+    }
+
+    if (!targetHref) return fetch(req);
+
+    const proxiedUrl = self.location.origin + PREFIX + targetHref;
+    const init = {
+      method: req.method,
+      headers: new Headers(req.headers),
+      credentials: 'include',
+      redirect: 'follow',
+    };
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      try {
+        const buf = await req.arrayBuffer();
+        if (buf.byteLength > 0) init.body = buf;
+      } catch (e) {}
+    }
+    return fetch(proxiedUrl, init);
+  })());
+});
+`;
+
+export const CLIENT_RUNTIME_SCRIPT = `(function(){
+if(window.__PROXY_RT__)return;window.__PROXY_RT__=1;
+var PRE='${PREFIX}',P=location.origin,W=P.replace(/^http/i,'ws'),SKIP=/^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
+try{if('serviceWorker' in navigator&&!navigator.serviceWorker.controller){navigator.serviceWorker.register('${SW_PATH}',{scope:'/'}).catch(function(){});}}catch(e){}
+function curTarget(){
+  try{
+    var pn=location.pathname;
+    var p=(pn.indexOf(PRE)===0?pn.substring(PRE.length):pn.substring(1))+location.search+location.hash;
+    p=p.replace(/^(https?|wss?):\\/(?!\\/)/i,'$1://');
+    if(/^https?:\\/\\//i.test(p))return p;
+  }catch(e){}
+  return location.href;
+}
+function rwHttp(u){
+  if(typeof u!=='string'){if(u&&typeof u.href==='string')u=u.href;else return u;}
+  var t=u.trim();if(!t||SKIP.test(t))return u;
+  if(t.indexOf(P+PRE)===0||t.indexOf(PRE)===0||t.indexOf(P+'/http')===0||t.indexOf(P+'/ws')===0||t.indexOf('/__proxy_')===0||t.indexOf(P+'/__proxy_')===0)return u;
+  if(/^\\/(https?|wss?):\\/\\//i.test(t))return P+PRE+t.substring(1);
+  try{
+    var r=new URL(t,curTarget());
+    if(r.origin===P){
+      var pn=r.pathname;
+      var sub=(pn.indexOf(PRE)===0?pn.substring(PRE.length):pn.substring(1)).replace(/^(https?|wss?):\\/(?!\\/)/i,'$1://');
+      if(/^(https?|wss?):\\/\\//i.test(sub))return P+PRE+sub+r.search+r.hash;
+      r=new URL(r.pathname+r.search+r.hash,new URL(curTarget()).origin);
+    }
+    if(r.protocol==='http:'||r.protocol==='https:')return P+PRE+r.href;
+    if(r.protocol==='ws:'||r.protocol==='wss:')return W+PRE+r.href;
+  }catch(e){}
+  return u;
+}
+function rwWs(u){
+  if(typeof u!=='string'){if(u&&typeof u.href==='string')u=u.href;else return u;}
+  var t=u.trim();if(!t||t.indexOf(W+PRE)===0||t.indexOf(W+'/ws')===0)return u;
+  try{
+    var tb=new URL(curTarget()),r=new URL(t,tb.href.replace(/^http/i,'ws'));
+    if(r.origin===W){
+      var pn=r.pathname;
+      var sub=(pn.indexOf(PRE)===0?pn.substring(PRE.length):pn.substring(1)).replace(/^(wss?):\\/(?!\\/)/i,'$1://');
+      if(/^wss?:\\/\\//i.test(sub))return W+PRE+sub+r.search;
+      r=new URL(r.pathname+r.search,tb.origin.replace(/^http/i,'ws'));
+    }
+    var o=W+PRE+r.href;return o+(o.indexOf('?')===-1?'?':'&')+'__proxy_origin='+encodeURIComponent(tb.origin);
+  }catch(e){}
+  return u;
+}
+function rwSrcset(v){
+  if(typeof v!=='string')return v;
+  return v.split(',').map(function(p){var t=p.trim();if(!t)return p;var i=t.search(/\\s/);if(i===-1)return rwHttp(t);return rwHttp(t.slice(0,i))+t.slice(i);}).join(', ');
+}
+var oReq=window.Request;
+if(oReq){var PReq=function(i,o){if(typeof i==='string'||i instanceof URL){i=rwHttp(String(i));}return arguments.length>1?new oReq(i,o):new oReq(i);};PReq.prototype=oReq.prototype;window.Request=PReq;}
+var oF=window.fetch;
+if(oF){window.fetch=function(a,b){try{if(typeof a==='string'||a instanceof URL){a=rwHttp(String(a));}else if(a instanceof oReq){var n2=rwHttp(a.url);if(n2!==a.url)a=new oReq(n2,a);}}catch(e){}return oF.call(this,a,b);};}
+try{if(navigator&&navigator.serviceWorker&&navigator.serviceWorker.register){var oSwReg=navigator.serviceWorker.register.bind(navigator.serviceWorker);navigator.serviceWorker.register=function(url,opts){if(String(url).indexOf('${SW_PATH}')!==-1)return oSwReg(url,opts);return Promise.reject(new DOMException('Upstream ServiceWorker disabled in proxy','SecurityError'));};}}catch(e){}
+var oXO=XMLHttpRequest.prototype.open;
+XMLHttpRequest.prototype.open=function(m,u){var a=Array.prototype.slice.call(arguments);if(typeof u==='string'||u instanceof URL){a[1]=rwHttp(String(u));}return oXO.apply(this,a);};
+var oWS=window.WebSocket;
+if(oWS){var PWS=function(u,p){var n=rwWs(u);return arguments.length>1?new oWS(n,p):new oWS(n);};PWS.prototype=oWS.prototype;PWS.CONNECTING=oWS.CONNECTING;PWS.OPEN=oWS.OPEN;PWS.CLOSING=oWS.CLOSING;PWS.CLOSED=oWS.CLOSED;window.WebSocket=PWS;}
+var oES=window.EventSource;
+if(oES){var PES=function(u,c){var n=rwHttp(u);return arguments.length>1?new oES(n,c):new oES(n);};PES.prototype=oES.prototype;PES.CONNECTING=oES.CONNECTING;PES.OPEN=oES.OPEN;PES.CLOSED=oES.CLOSED;window.EventSource=PES;}
+var oW=window.Worker;
+if(oW){var PW=function(u,o){var n=rwHttp(u);return arguments.length>1?new oW(n,o):new oW(n);};PW.prototype=oW.prototype;window.Worker=PW;}
+if(navigator&&navigator.sendBeacon){var oB=navigator.sendBeacon.bind(navigator);navigator.sendBeacon=function(u,d){return oB(rwHttp(u),d);};}
+function wH(fn){var o=History.prototype[fn];if(!o)return;History.prototype[fn]=function(s,t,u){if(u!==undefined&&u!==null&&u!==''){try{var n=rwHttp(String(u));if(n&&n.indexOf(P)===0)u=n.substring(P.length);}catch(e){}}return o.call(this,s,t,u);};}
+wH('pushState');wH('replaceState');
+var oOp=window.open;if(oOp){window.open=function(u,t,f){if(u)u=rwHttp(String(u));return oOp.call(this,u,t,f);};}
+var UA={src:1,href:1,action:1,poster:1,data:1},oSA=Element.prototype.setAttribute;
+Element.prototype.setAttribute=function(k,v){var l=String(k).toLowerCase();if(l==='integrity')return;if(l==='srcset')v=rwSrcset(String(v));else if(UA[l]&&typeof v==='string'){v=rwHttp(v);}return oSA.call(this,k,v);};
+function hP(pr,k,ss){if(!pr)return;var d=Object.getOwnPropertyDescriptor(pr,k);if(!d||!d.set)return;Object.defineProperty(pr,k,{configurable:true,enumerable:d.enumerable,get:d.get,set:function(v){if(typeof v==='string'){v=ss?rwSrcset(v):rwHttp(v);}return d.set.call(this,v);}});}
+hP(HTMLScriptElement.prototype,'src',0);hP(HTMLImageElement.prototype,'src',0);hP(HTMLImageElement.prototype,'srcset',1);hP(HTMLLinkElement.prototype,'href',0);hP(HTMLAnchorElement.prototype,'href',0);hP(HTMLFormElement.prototype,'action',0);hP(HTMLIFrameElement.prototype,'src',0);hP(HTMLSourceElement.prototype,'src',0);hP(HTMLSourceElement.prototype,'srcset',1);hP(HTMLMediaElement.prototype,'src',0);
+function igP(pr,k){if(!pr)return;var d=Object.getOwnPropertyDescriptor(pr,k);if(!d||!d.configurable)return;Object.defineProperty(pr,k,{configurable:true,enumerable:d.enumerable,get:function(){return'';},set:function(){}});}
+igP(HTMLScriptElement.prototype,'integrity');igP(HTMLLinkElement.prototype,'integrity');
+})();`;
+
+// ============================================================================
+// Streaming Cloudflare HTMLRewriter
+// ============================================================================
+
 function streamRewriteHtml(response, baseUrl, proxyBase) {
   const runtimeTag = `<script src="${proxyBase}${RUNTIME_PATH}"></script>`;
   let runtimeInjected = false;
@@ -76,9 +956,7 @@ function streamRewriteHtml(response, baseUrl, proxyBase) {
     .on('meta[http-equiv]', {
       element(el) {
         const equiv = (el.getAttribute('http-equiv') || '').toLowerCase();
-        if (equiv === 'content-security-policy') {
-          el.remove();
-        }
+        if (equiv === 'content-security-policy') el.remove();
       },
     })
     .on('script[integrity], link[integrity]', {
@@ -106,7 +984,8 @@ function streamRewriteHtml(response, baseUrl, proxyBase) {
             styleBuf.indexOf('url(') !== -1 || styleBuf.indexOf('@import') !== -1
               ? rewriteCss(styleBuf, baseUrl, proxyBase)
               : styleBuf;
-          chunk.replace(out);
+          // { html: true } prevents escaping CSS selectors like `>` or quotes!
+          chunk.replace(out, { html: true });
           styleBuf = '';
         } else {
           chunk.remove();
@@ -117,10 +996,6 @@ function streamRewriteHtml(response, baseUrl, proxyBase) {
   return rewriter.transform(response);
 }
 
-/**
- * Render a tiny bootstrapper page that ensures /__proxy_sw.js is registered & active
- * before navigating to the proxied site (jsproxy pattern).
- */
 function renderSwBootstrapPage(targetUrl) {
   const safeTarget = JSON.stringify(PREFIX + targetUrl);
   return new Response(
@@ -132,7 +1007,7 @@ function renderSwBootstrapPage(targetUrl) {
   <style>body{background:#161512;color:#ecebe8;font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0;}</style>
 </head>
 <body>
-  <p id="s">Starting proxy service worker…</p>
+  <p>Starting proxy service worker…</p>
   <script>
     (async function () {
       var dest = ${safeTarget};
@@ -147,14 +1022,13 @@ function renderSwBootstrapPage(targetUrl) {
   </script>
 </body>
 </html>`,
-    {
-      headers: {
-        'Content-Type': 'text/html; charset=utf-8',
-        'Cache-Control': 'no-store',
-      },
-    }
+    { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' } }
   );
 }
+
+// ============================================================================
+// Main Cloudflare Worker Entrypoint
+// ============================================================================
 
 export default {
   async fetch(request, env, ctx) {
@@ -169,7 +1043,7 @@ export default {
       }
     }
 
-    // 2. Fast path: CORS preflight
+    // 2. CORS preflight
     if (request.method === 'OPTIONS') {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
@@ -178,27 +1052,68 @@ export default {
     const proxyBase = url.origin;
     const isHttpsProxy = url.protocol === 'https:';
 
-    // 3. Fast path: Health check
+    // 3. Health check
     if (url.pathname === HEALTH_PATH) {
       return new Response(
         JSON.stringify({
           ok: true,
           runtime: 'cloudflare-worker',
+          youtube: true,
           websockets: true,
           serviceWorker: true,
           streamingHtml: typeof HTMLRewriter !== 'undefined',
         }),
-        {
-          status: 200,
-          headers: {
-            'Content-Type': 'application/json',
-            ...corsHeaders(request),
-          },
-        }
+        { status: 200, headers: { 'Content-Type': 'application/json', ...corsHeaders(request) } }
       );
     }
 
-    // 4. Fast path: Service Worker script (jsproxy-style full network interception)
+    // 4. Built-in Native YouTube Routes (/yt, /yt/watch, /yt/api/*)
+    if (url.pathname === '/yt' || url.pathname === '/yt/') {
+      const q = url.searchParams.get('q') || '';
+      const vid = extractVideoId(q);
+      if (vid) {
+        return Response.redirect(`${proxyBase}/yt/watch?v=${vid}`, 302);
+      }
+      return renderYouTubeShell(proxyBase, q, '');
+    }
+
+    if (url.pathname === '/yt/watch') {
+      const v = extractVideoId(url.searchParams.get('v') || '');
+      if (!v) return Response.redirect(`${proxyBase}/yt`, 302);
+      return renderYouTubeShell(proxyBase, '', v);
+    }
+
+    if (url.pathname === '/yt/api/search') {
+      const q = url.searchParams.get('q') || '';
+      const videos = await fetchInnerTubeSearch(q);
+      return new Response(JSON.stringify({ videos }), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=120', ...corsHeaders(request) },
+      });
+    }
+
+    if (url.pathname === '/yt/api/player') {
+      const v = extractVideoId(url.searchParams.get('v') || '');
+      if (!v) {
+        return new Response(JSON.stringify({ error: 'Invalid video ID' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...corsHeaders(request) },
+        });
+      }
+      const data = await fetchInnerTubePlayer(v, proxyBase);
+      return new Response(JSON.stringify(data), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', ...corsHeaders(request) },
+      });
+    }
+
+    if (url.pathname === '/yt/api/related') {
+      const v = extractVideoId(url.searchParams.get('v') || '');
+      const videos = v ? await fetchInnerTubeRelated(v) : [];
+      return new Response(JSON.stringify({ videos }), {
+        headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=300', ...corsHeaders(request) },
+      });
+    }
+
+    // 5. Service Worker & Client Runtime
     if (url.pathname === SW_PATH) {
       return new Response(SERVICE_WORKER_SCRIPT, {
         status: 200,
@@ -211,7 +1126,6 @@ export default {
       });
     }
 
-    // 5. Fast path: Static cached client runtime
     if (url.pathname === RUNTIME_PATH) {
       return new Response(CLIENT_RUNTIME_SCRIPT, {
         status: 200,
@@ -223,14 +1137,13 @@ export default {
       });
     }
 
-    // 6. Fast path: Service Worker bootstrapper (/ __proxy_go?url=...)
     if (url.pathname === '/__proxy_go' && url.searchParams.has('url')) {
       let dest = (url.searchParams.get('url') || '').trim();
       if (!/^https?:\/\//i.test(dest)) dest = 'https://' + dest;
       return renderSwBootstrapPage(dest);
     }
 
-    // 7. Root launcher UI (registers Service Worker before navigating!)
+    // 6. Root Launcher UI (100% Cloudflare Workers)
     if (url.pathname === '/' && !url.searchParams.has('url')) {
       return new Response(
         `<!DOCTYPE html>
@@ -241,29 +1154,31 @@ export default {
   <title>Cloudflare Web Proxy</title>
   <style>
     body { font-family: system-ui, -apple-system, sans-serif; display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #161512; color: #ecebe8; margin: 0; }
-    .container { background: #262421; border: 1px solid #3a3733; padding: 2rem; border-radius: 12px; box-shadow: 0 12px 32px rgba(0,0,0,0.45); width: min(460px, 92vw); }
-    h2 { margin: 0 0 0.4rem; font-size: 1.35rem; }
-    p { margin: 0 0 1rem; color: #a6a39e; font-size: 0.85rem; }
+    .container { background: #262421; border: 1px solid #3a3733; padding: 2rem; border-radius: 14px; box-shadow: 0 14px 36px rgba(0,0,0,0.5); width: min(480px, 92vw); }
+    h2 { margin: 0 0 0.4rem; font-size: 1.4rem; }
+    p { margin: 0 0 1.1rem; color: #a6a39e; font-size: 0.86rem; }
     form { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
-    input[type="text"] { flex: 1; padding: 0.65rem 0.75rem; border: 1px solid #3a3733; border-radius: 6px; background: #161512; color: #fff; font-size: 0.92rem; }
-    button, a.btn { padding: 0.65rem 1rem; background: #81b64c; color: #161512; border: none; border-radius: 6px; cursor: pointer; font-weight: 700; text-decoration: none; display: inline-block; text-align: center; }
+    input[type="text"] { flex: 1; padding: 0.65rem 0.8rem; border: 1px solid #3a3733; border-radius: 8px; background: #161512; color: #fff; font-size: 0.94rem; }
+    button, a.btn { padding: 0.65rem 1rem; background: #81b64c; color: #161512; border: none; border-radius: 8px; cursor: pointer; font-weight: 700; text-decoration: none; display: inline-block; text-align: center; }
     button:hover, a.btn:hover { background: #95cc5d; }
     .quick { display: flex; gap: 0.5rem; flex-wrap: wrap; }
-    .quick a.btn { background: #33302c; color: #ecebe8; font-size: 0.84rem; font-weight: 600; border: 1px solid #3a3733; }
+    .quick a.btn { background: #33302c; color: #ecebe8; font-size: 0.85rem; font-weight: 600; border: 1px solid #3a3733; }
+    .quick a.btn.yt { background: #ff0033; color: #fff; border-color: #ff0033; }
+    .quick a.btn.yt:hover { background: #d9002b; }
     .quick a.btn:hover { background: #403d38; }
-    .sw-status { margin-top: 0.85rem; font-size: 0.78rem; color: #81b64c; }
+    .sw-status { margin-top: 0.9rem; font-size: 0.78rem; color: #81b64c; }
   </style>
 </head>
 <body>
   <div class="container">
     <h2>🌐 Cloudflare Web Proxy</h2>
-    <p>All Websites • Service Worker Engine • YouTube &amp; Chess.com Ready</p>
+    <p>100% Cloudflare Workers • Built-in Fast YouTube Player • All Websites</p>
     <form action="/" method="GET" id="proxy-form">
-      <input type="text" name="url" placeholder="Enter any URL (e.g. https://www.youtube.com)" required>
+      <input type="text" name="url" placeholder="Enter any URL (YouTube, Chess.com, etc.)" required>
       <button type="submit">Go</button>
     </form>
     <div class="quick">
-      <a class="btn" data-url="https://www.youtube.com" href="/__proxy_go?url=https%3A%2F%2Fwww.youtube.com">▶ YouTube</a>
+      <a class="btn yt" href="/yt">▶ YouTube (Fast Player)</a>
       <a class="btn" data-url="https://www.chess.com/play" href="/__proxy_go?url=https%3A%2F%2Fwww.chess.com%2Fplay">♟ Chess.com</a>
       <a class="btn" data-url="https://www.wikipedia.org" href="/__proxy_go?url=https%3A%2F%2Fwww.wikipedia.org">📚 Wikipedia</a>
     </div>
@@ -275,47 +1190,37 @@ export default {
           if ('serviceWorker' in navigator) {
             await navigator.serviceWorker.register('${SW_PATH}', { scope: '/' });
             await navigator.serviceWorker.ready;
-            el.textContent = '✓ Service Worker active — ready for YouTube & all sites';
-          } else {
-            el.textContent = 'Service Worker unavailable (using fallback mode)';
+            el.textContent = '✓ Service Worker active';
           }
-        } catch (e) {
-          el.textContent = 'Service Worker fallback mode';
-        }
+        } catch (e) { el.textContent = 'Ready'; }
       })();
 
-      async function go(targetUrl) {
+      async function go(raw) {
+        var val = raw.trim();
+        var ytMatch = val.match(/(?:youtube\\.com\\/watch\\?[^#]*v=|youtu\\.be\\/|youtube\\.com\\/shorts\\/)([a-zA-Z0-9_-]{11})/i);
+        if (ytMatch) { window.location.href = '/yt/watch?v=' + ytMatch[1]; return; }
+        if (/^(?:https?:\\/\\/)?(?:www\\.|m\\.)?youtube\\.com\\/?$/i.test(val)) { window.location.href = '/yt'; return; }
         await swReady;
-        targetUrl = targetUrl.trim();
-        if (!/^https?:\\/\\//i.test(targetUrl)) targetUrl = 'https://' + targetUrl;
-        window.location.href = '${PREFIX}' + targetUrl;
+        if (!/^https?:\\/\\//i.test(val)) val = 'https://' + val;
+        window.location.href = '${PREFIX}' + val;
       }
 
       document.getElementById('proxy-form').addEventListener('submit', function(e) {
         e.preventDefault();
         go(document.querySelector('input[name="url"]').value);
       });
-
       document.querySelectorAll('.quick a[data-url]').forEach(function(a) {
-        a.addEventListener('click', function(e) {
-          e.preventDefault();
-          go(a.getAttribute('data-url'));
-        });
+        a.addEventListener('click', function(e) { e.preventDefault(); go(a.getAttribute('data-url')); });
       });
     </script>
   </div>
 </body>
 </html>`,
-        {
-          headers: {
-            'Content-Type': 'text/html; charset=utf-8',
-            'Cache-Control': 'public, max-age=600',
-          },
-        }
+        { headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'public, max-age=600' } }
       );
     }
 
-    // 8. Resolve target URL
+    // 7. Resolve target URL
     const refererHeader = request.headers.get('Referer');
     const resolved = resolveIncomingTargetUrl(url, refererHeader);
     if (resolved.error) {
@@ -331,7 +1236,7 @@ export default {
 
     const isStreamingMedia = isStreamingMediaUrl(fetchUrl);
 
-    // 9. Check Cloudflare Edge Cache for GET static assets (never cache videoplayback streams)
+    // 8. Check Cloudflare Edge Cache for GET static assets (never cache videoplayback streams)
     const isCacheableStatic =
       request.method === 'GET' && !isWebSocket && !isStreamingMedia && isStaticAssetUrl(fetchUrl);
     const edgeCache =
@@ -343,11 +1248,11 @@ export default {
         const cached = await edgeCache.match(cacheKey);
         if (cached) return cached;
       } catch {
-        // Ignore cache errors on workers.dev
+        // ignore
       }
     }
 
-    // 10. Build upstream request headers
+    // 9. Build upstream headers
     const newHeaders = new Headers(request.headers);
     newHeaders.set('Host', fetchUrl.host);
 
@@ -364,12 +1269,9 @@ export default {
     if (request.headers.has('Origin') || isWebSocket || isGoogleVideo) {
       newHeaders.set('Origin', upstreamOrigin);
     }
-
-    // Rewrite YouTube InnerTube X-Origin header so API requests match upstream origin
     if (newHeaders.has('x-origin')) {
       newHeaders.set('x-origin', upstreamOrigin);
     }
-
     if (isGoogleVideo) {
       newHeaders.set('Referer', 'https://www.youtube.com/');
     } else if (refererHeader) {
@@ -377,46 +1279,38 @@ export default {
       newHeaders.set('Referer', refTarget ? refTarget.href : fetchUrl.origin + '/');
     }
 
-    // Prevent YouTube GDPR consent wall on European/cloud Cloudflare PoPs
     if (isYouTube) {
       const existingCookie = newHeaders.get('cookie') || '';
       if (!existingCookie.includes('CONSENT=')) {
-        newHeaders.set(
-          'cookie',
-          existingCookie ? `${existingCookie}; CONSENT=YES+cb` : 'CONSENT=YES+cb'
-        );
+        newHeaders.set('cookie', existingCookie ? `${existingCookie}; CONSENT=YES+cb` : 'CONSENT=YES+cb');
       }
     }
 
-    // Strip proxy/CF identifying headers
-    newHeaders.delete('cf-connecting-ip');
-    newHeaders.delete('cf-ipcountry');
-    newHeaders.delete('cf-visitor');
-    newHeaders.delete('cf-ray');
-    newHeaders.delete('cf-worker');
-    newHeaders.delete('x-forwarded-for');
-    newHeaders.delete('x-forwarded-proto');
-    newHeaders.delete('x-real-ip');
+    // Strip proxy, CF, and sec-fetch-* headers that can cause upstream rejections
+    for (const h of [
+      'cf-connecting-ip', 'cf-ipcountry', 'cf-visitor', 'cf-ray', 'cf-worker',
+      'x-forwarded-for', 'x-forwarded-proto', 'x-real-ip',
+      'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest',
+    ]) {
+      newHeaders.delete(h);
+    }
 
-    // Strip cookies on public static CDNs (ytimg, ggpht, chesscomfiles, gstatic) for max edge cache hits
     if (isCacheableStatic && isCookieFreeCdn(fetchUrl.hostname)) {
       newHeaders.delete('cookie');
     }
 
-    // 11. WebSocket passthrough
+    // 10. WebSocket passthrough
     if (isWebSocket) {
       try {
         const wsResp = await fetch(fetchUrl.href, { headers: newHeaders });
-        if (wsResp.webSocket) {
-          return new Response(null, { status: 101, webSocket: wsResp.webSocket });
-        }
+        if (wsResp.webSocket) return new Response(null, { status: 101, webSocket: wsResp.webSocket });
         return wsResp;
       } catch (e) {
         return new Response('WebSocket proxy error: ' + e.message, { status: 502 });
       }
     }
 
-    // 12. Fetch upstream (enable Cloudflare edge caching for static assets only)
+    // 11. Fetch upstream
     const fetchInit = {
       method: request.method,
       headers: newHeaders,
@@ -435,18 +1329,14 @@ export default {
     }
 
     const responseHeaders = new Headers(response.headers);
+    for (const h of [
+      'x-frame-options', 'content-security-policy', 'content-security-policy-report-only',
+      'clear-site-data', 'cross-origin-embedder-policy', 'cross-origin-opener-policy',
+      'cross-origin-resource-policy', 'strict-transport-security',
+    ]) {
+      responseHeaders.delete(h);
+    }
 
-    // Strip restrictive security/frame headers
-    responseHeaders.delete('x-frame-options');
-    responseHeaders.delete('content-security-policy');
-    responseHeaders.delete('content-security-policy-report-only');
-    responseHeaders.delete('clear-site-data');
-    responseHeaders.delete('cross-origin-embedder-policy');
-    responseHeaders.delete('cross-origin-opener-policy');
-    responseHeaders.delete('cross-origin-resource-policy');
-    responseHeaders.delete('strict-transport-security');
-
-    // Rewrite Set-Cookie headers
     const setCookies =
       typeof response.headers.getSetCookie === 'function'
         ? response.headers.getSetCookie()
@@ -461,7 +1351,6 @@ export default {
       }
     }
 
-    // Rewrite redirects to stay on /-----<url>
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = responseHeaders.get('location');
       if (location) {
@@ -474,13 +1363,9 @@ export default {
       }
     }
 
-    // Apply CORS headers
     const cors = corsHeaders(request);
-    for (const [k, v] of Object.entries(cors)) {
-      responseHeaders.set(k, v);
-    }
+    for (const [k, v] of Object.entries(cors)) responseHeaders.set(k, v);
 
-    // Encourage aggressive browser & edge caching on static assets without cookies
     const shouldCacheResponse =
       isCacheableStatic && response.status === 200 && setCookies.length === 0;
     if (shouldCacheResponse) {
@@ -489,7 +1374,7 @@ export default {
 
     const contentType = (responseHeaders.get('content-type') || '').toLowerCase();
 
-    // 13. Streaming HTML rewriting via native Cloudflare HTMLRewriter
+    // 12. Streaming HTML rewriting
     if (contentType.includes('text/html')) {
       responseHeaders.delete('content-encoding');
       responseHeaders.delete('content-length');
@@ -498,27 +1383,35 @@ export default {
         statusText: response.statusText,
         headers: responseHeaders,
       });
-
       if (typeof HTMLRewriter !== 'undefined') {
         return streamRewriteHtml(baseResp, fetchUrl.href, proxyBase);
       }
-      const html = await baseResp.text();
-      return new Response(rewriteHtml(html, fetchUrl.href, proxyBase), {
+      return baseResp;
+    }
+
+    // 13. HLS (.m3u8) manifest rewriting for YouTube HD HLS streams
+    if (
+      contentType.includes('mpegurl') ||
+      fetchUrl.pathname.toLowerCase().endsWith('.m3u8')
+    ) {
+      const text = await response.text();
+      responseHeaders.delete('content-encoding');
+      responseHeaders.delete('content-length');
+      return new Response(rewriteM3u8(text, fetchUrl.href, proxyBase), {
         status: response.status,
         statusText: response.statusText,
         headers: responseHeaders,
       });
     }
 
-    // 14. Size-guarded fast CSS rewriting (cached after first rewrite)
+    // 14. Size-guarded fast CSS rewriting
     if (contentType.includes('text/css')) {
       const contentLen = Number(responseHeaders.get('content-length') || '0');
       if (contentLen <= MAX_CSS_REWRITE_BYTES) {
         const css = await response.text();
-        const rewritten = rewriteCss(css, fetchUrl.href, proxyBase);
         responseHeaders.delete('content-encoding');
         responseHeaders.delete('content-length');
-        const outResp = new Response(rewritten, {
+        const outResp = new Response(rewriteCss(css, fetchUrl.href, proxyBase), {
           status: response.status,
           statusText: response.statusText,
           headers: responseHeaders,
@@ -530,17 +1423,15 @@ export default {
       }
     }
 
-    // 15. Zero-copy streaming for all other assets (googlevideo.com, JS, WASM, PNG, SVG, MP3, JSON, fonts)
+    // 15. Zero-copy streaming for videoplayback, JS, WASM, images, audio, JSON
     const outResp = new Response(response.body, {
       status: response.status,
       statusText: response.statusText,
       headers: responseHeaders,
     });
-
     if (shouldCacheResponse && edgeCache && cacheKey && ctx && ctx.waitUntil) {
       ctx.waitUntil(edgeCache.put(cacheKey, outResp.clone()).catch(() => {}));
     }
-
     return outResp;
   },
 };

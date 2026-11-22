@@ -1,0 +1,623 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chess.com Proxy — GitHub Pages</title>
+  <style>
+    :root {
+      --bg: #161512;
+      --surface: #262421;
+      --surface-hover: #33302c;
+      --border: #3a3733;
+      --text: #ecebe8;
+      --muted: #a6a39e;
+      --accent: #81b64c;
+      --accent-hover: #95cc5d;
+      --danger: #e05252;
+      --warn: #e0a83a;
+    }
+
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      overflow: hidden;
+    }
+
+    .app {
+      display: flex;
+      flex-direction: column;
+      width: 100%;
+      height: 100%;
+    }
+
+    /* Top Toolbar */
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.45rem 0.75rem;
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+      flex-wrap: wrap;
+    }
+
+    .toolbar.hidden {
+      display: none;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+      font-weight: 700;
+      font-size: 0.95rem;
+      color: #fff;
+      margin-right: 0.25rem;
+      white-space: nowrap;
+    }
+
+    .brand-icon {
+      width: 24px;
+      height: 24px;
+      border-radius: 6px;
+      background: var(--accent);
+      display: grid;
+      place-items: center;
+      font-size: 0.95rem;
+      color: #161512;
+    }
+
+    .quick-nav {
+      display: flex;
+      align-items: center;
+      gap: 0.25rem;
+    }
+
+    .btn {
+      background: var(--surface-hover);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.38rem 0.65rem;
+      font-size: 0.82rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: background 0.15s, border-color 0.15s;
+    }
+
+    .btn:hover {
+      background: #403d38;
+      border-color: #524e48;
+    }
+
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #161512;
+    }
+
+    .btn.primary:hover {
+      background: var(--accent-hover);
+      border-color: var(--accent-hover);
+    }
+
+    .url-form {
+      display: flex;
+      flex: 1;
+      min-width: 180px;
+      gap: 0.35rem;
+    }
+
+    .url-input {
+      flex: 1;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.38rem 0.65rem;
+      font-size: 0.84rem;
+      outline: none;
+    }
+
+    .url-input:focus {
+      border-color: var(--accent);
+    }
+
+    .status-btn {
+      display: flex;
+      align-items: center;
+      gap: 0.4rem;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+
+    .dot.ok { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
+    .dot.err { background: var(--danger); }
+    .dot.checking { background: var(--warn); }
+
+    /* Viewport */
+    .viewport {
+      position: relative;
+      flex: 1;
+      width: 100%;
+      height: 100%;
+      background: var(--bg);
+    }
+
+    iframe#proxy-frame {
+      width: 100%;
+      height: 100%;
+      border: none;
+      display: block;
+      background: #fff;
+    }
+
+    /* Floating restore button when toolbar is hidden */
+    .restore-pill {
+      position: fixed;
+      top: 8px;
+      right: 8px;
+      z-index: 9999;
+      background: rgba(38, 36, 33, 0.9);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 0.3rem 0.7rem;
+      font-size: 0.75rem;
+      font-weight: 600;
+      cursor: pointer;
+      display: none;
+      backdrop-filter: blur(6px);
+    }
+
+    .restore-pill.visible {
+      display: block;
+    }
+
+    /* Setup / Settings Overlay */
+    .overlay {
+      position: absolute;
+      inset: 0;
+      background: rgba(22, 21, 18, 0.92);
+      backdrop-filter: blur(8px);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 1rem;
+      z-index: 100;
+      overflow-y: auto;
+    }
+
+    .overlay.hidden {
+      display: none;
+    }
+
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.75rem;
+      width: min(560px, 100%);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+    }
+
+    .card h1 {
+      margin: 0 0 0.4rem;
+      font-size: 1.35rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .card p {
+      margin: 0 0 1rem;
+      color: var(--muted);
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
+    .field-label {
+      display: block;
+      font-size: 0.82rem;
+      font-weight: 600;
+      margin-bottom: 0.35rem;
+      color: var(--text);
+    }
+
+    .input-row {
+      display: flex;
+      gap: 0.5rem;
+      margin-bottom: 0.75rem;
+    }
+
+    .input-row input {
+      flex: 1;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.6rem 0.75rem;
+      font-size: 0.92rem;
+    }
+
+    .input-row input:focus {
+      outline: none;
+      border-color: var(--accent);
+    }
+
+    .feedback {
+      font-size: 0.84rem;
+      min-height: 1.25rem;
+      margin-bottom: 1rem;
+    }
+
+    .feedback.ok { color: var(--accent); }
+    .feedback.err { color: var(--danger); }
+    .feedback.warn { color: var(--warn); }
+
+    .steps {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+      margin-top: 0.75rem;
+      font-size: 0.84rem;
+      color: var(--muted);
+      line-height: 1.55;
+    }
+
+    .steps strong { color: var(--text); }
+    .steps code {
+      background: #2b2926;
+      padding: 0.12rem 0.35rem;
+      border-radius: 4px;
+      color: #d7e8c0;
+      font-size: 0.8rem;
+    }
+
+    .steps ul {
+      margin: 0.4rem 0 0;
+      padding-left: 1.2rem;
+    }
+
+    .steps li { margin-bottom: 0.35rem; }
+
+    .card-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-top: 1rem;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+    }
+
+    .tip {
+      font-size: 0.78rem;
+      color: var(--muted);
+      margin-top: 0.85rem;
+      border-top: 1px solid var(--border);
+      padding-top: 0.75rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header class="toolbar" id="toolbar">
+      <div class="brand">
+        <span class="brand-icon">♞</span>
+        <span>Chess Proxy</span>
+      </div>
+
+      <div class="quick-nav">
+        <button class="btn primary" data-target="https://www.chess.com/play">Play</button>
+        <button class="btn" data-target="https://www.chess.com/play/online">Online</button>
+        <button class="btn" data-target="https://www.chess.com/play/computer">Bots</button>
+        <button class="btn" data-target="https://www.chess.com/puzzles">Puzzles</button>
+        <button class="btn" data-target="https://www.chess.com/login_and_go">Login</button>
+      </div>
+
+      <form class="url-form" id="url-form">
+        <input
+          type="text"
+          class="url-input"
+          id="url-input"
+          value="https://www.chess.com/play"
+          placeholder="https://www.chess.com/play"
+          aria-label="Target URL"
+        >
+        <button type="submit" class="btn">Go</button>
+      </form>
+
+      <button class="btn status-btn" id="backend-btn" title="Configure Proxy Backend">
+        <span class="dot" id="status-dot"></span>
+        <span id="status-text">Backend</span>
+      </button>
+
+      <button class="btn" id="reload-btn" title="Reload">↻</button>
+      <button class="btn" id="direct-btn" title="Open directly on proxy tab (best if browser blocks iframe cookies)">↗ Direct</button>
+      <button class="btn" id="fullscreen-btn" title="Toggle Fullscreen">⛶</button>
+      <button class="btn" id="hide-bar-btn" title="Hide Toolbar">▲</button>
+    </header>
+
+    <main class="viewport">
+      <iframe
+        id="proxy-frame"
+        title="Chess.com Proxy Viewport"
+        allow="fullscreen; autoplay; clipboard-read; clipboard-write"
+        referrerpolicy="no-referrer"
+      ></iframe>
+
+      <div class="overlay" id="setup-overlay">
+        <div class="card">
+          <h1>♞ Play Chess.com on GitHub Pages</h1>
+          <p>
+            GitHub Pages hosts this static frontend, while your deployed
+            <strong>Cloudflare Worker</strong> or <strong>Render</strong> backend from this repo
+            relays Chess.com HTTP requests, cookies, and live-game WebSockets.
+          </p>
+
+          <label class="field-label" for="backend-input">Proxy Backend URL</label>
+          <div class="input-row">
+            <input
+              type="url"
+              id="backend-input"
+              placeholder="https://web-proxy.your-name.workers.dev"
+              autocomplete="url"
+            >
+            <button class="btn primary" id="connect-btn">Connect &amp; Play</button>
+          </div>
+          <div class="feedback" id="feedback"></div>
+
+          <div class="steps">
+            <strong>Need a free backend URL? Deploy in 1 minute:</strong>
+            <ul>
+              <li>
+                <strong>Cloudflare Workers (Recommended):</strong> Run
+                <code>npx wrangler deploy</code> in this repo (uses <code>src/index.js</code>)
+                and paste your <code>https://*.workers.dev</code> URL above.
+              </li>
+              <li>
+                <strong>Render:</strong> Connect this GitHub repo as a Node Web Service
+                (<code>npm start</code>, uses <code>server.js</code>) and paste your
+                <code>https://*.onrender.com</code> URL above.
+              </li>
+              <li>
+                <strong>Shareable link:</strong> Append
+                <code>?backend=https://your-worker.workers.dev</code> to this GitHub Pages URL
+                to auto-connect on any device.
+              </li>
+            </ul>
+          </div>
+
+          <div class="card-actions">
+            <button class="btn" id="close-overlay-btn" style="display:none;">Back to Board</button>
+            <button class="btn" id="open-direct-setup-btn" style="display:none;">Open Direct Tab ↗</button>
+          </div>
+
+          <div class="tip">
+            <strong>Tip:</strong> If your browser blocks third-party cookies inside iframes (e.g., Safari or Brave Shields) and Chess.com login won't stay signed in, click <strong>↗ Direct</strong> to open Chess.com directly on your proxy backend.
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <button class="restore-pill" id="restore-pill">♞ Show Bar</button>
+
+  <script>
+    (function () {
+      const STORAGE_KEY = 'chess_proxy_backend_url';
+      const DEFAULT_TARGET = 'https://www.chess.com/play';
+
+      const toolbar = document.getElementById('toolbar');
+      const restorePill = document.getElementById('restore-pill');
+      const iframe = document.getElementById('proxy-frame');
+      const urlForm = document.getElementById('url-form');
+      const urlInput = document.getElementById('url-input');
+      const backendBtn = document.getElementById('backend-btn');
+      const statusDot = document.getElementById('status-dot');
+      const statusText = document.getElementById('status-text');
+      const reloadBtn = document.getElementById('reload-btn');
+      const directBtn = document.getElementById('direct-btn');
+      const fullscreenBtn = document.getElementById('fullscreen-btn');
+      const hideBarBtn = document.getElementById('hide-bar-btn');
+
+      const overlay = document.getElementById('setup-overlay');
+      const backendInput = document.getElementById('backend-input');
+      const connectBtn = document.getElementById('connect-btn');
+      const feedback = document.getElementById('feedback');
+      const closeOverlayBtn = document.getElementById('close-overlay-btn');
+      const openDirectSetupBtn = document.getElementById('open-direct-setup-btn');
+
+      let backendUrl = '';
+      let currentTarget = DEFAULT_TARGET;
+
+      function normalizeBackend(raw) {
+        let val = (raw || '').trim();
+        if (!val) return '';
+        if (!/^https?:\/\//i.test(val)) val = 'https://' + val;
+        return val.replace(/\/+$/, '');
+      }
+
+      function normalizeTarget(raw) {
+        let val = (raw || '').trim();
+        if (!val) return DEFAULT_TARGET;
+        if (!/^https?:\/\//i.test(val)) val = 'https://' + val;
+        return val;
+      }
+
+      function setStatus(state, label) {
+        statusDot.className = 'dot ' + state;
+        statusText.textContent = label;
+      }
+
+      function setFeedback(msg, cls) {
+        feedback.textContent = msg;
+        feedback.className = 'feedback ' + (cls || '');
+      }
+
+      async function checkBackendHealth(baseUrl) {
+        setStatus('checking', 'Checking…');
+        try {
+          const resp = await fetch(baseUrl + '/__proxy_health', { mode: 'cors' });
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const data = await resp.json();
+          if (data && data.ok) {
+            setStatus('ok', data.websockets ? 'Connected (WS)' : 'Connected');
+            return { ok: true, data };
+          }
+          throw new Error('Unexpected health response');
+        } catch (err) {
+          setStatus('err', 'Offline');
+          return { ok: false, error: err.message };
+        }
+      }
+
+      function loadTarget(targetUrl) {
+        if (!backendUrl) {
+          overlay.classList.remove('hidden');
+          return;
+        }
+        currentTarget = normalizeTarget(targetUrl);
+        urlInput.value = currentTarget;
+        iframe.src = backendUrl + '/' + currentTarget;
+      }
+
+      async function connectBackend(rawUrl, autoLoad) {
+        const normalized = normalizeBackend(rawUrl);
+        if (!normalized) {
+          setFeedback('Please enter your Cloudflare Worker or Render proxy URL.', 'err');
+          return false;
+        }
+
+        setFeedback('Testing proxy backend & WebSocket support…', 'warn');
+        const health = await checkBackendHealth(normalized);
+
+        backendUrl = normalized;
+        localStorage.setItem(STORAGE_KEY, backendUrl);
+        backendInput.value = backendUrl;
+        closeOverlayBtn.style.display = 'inline-block';
+        openDirectSetupBtn.style.display = 'inline-block';
+
+        if (health.ok) {
+          setFeedback(
+            'Connected (' + (health.data.runtime || 'proxy') + ', WebSockets ready)!',
+            'ok'
+          );
+          if (autoLoad) {
+            overlay.classList.add('hidden');
+            loadTarget(currentTarget);
+          }
+          return true;
+        } else {
+          setFeedback(
+            'Health check failed (' + health.error + '). Check the URL or CORS/ALLOWED_IPS settings.',
+            'err'
+          );
+          return false;
+        }
+      }
+
+      // Quick nav buttons
+      document.querySelectorAll('.quick-nav [data-target]').forEach((btn) => {
+        btn.addEventListener('click', () => loadTarget(btn.getAttribute('data-target')));
+      });
+
+      urlForm.addEventListener('submit', (e) => {
+        e.preventDefault();
+        loadTarget(urlInput.value);
+      });
+
+      backendBtn.addEventListener('click', () => {
+        backendInput.value = backendUrl;
+        overlay.classList.remove('hidden');
+      });
+
+      connectBtn.addEventListener('click', () => {
+        connectBackend(backendInput.value, true);
+      });
+
+      backendInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          connectBackend(backendInput.value, true);
+        }
+      });
+
+      closeOverlayBtn.addEventListener('click', () => {
+        overlay.classList.add('hidden');
+      });
+
+      reloadBtn.addEventListener('click', () => {
+        if (backendUrl) loadTarget(currentTarget);
+      });
+
+      function openDirect() {
+        if (!backendUrl) {
+          overlay.classList.remove('hidden');
+          return;
+        }
+        window.open(backendUrl + '/' + currentTarget, '_blank', 'noopener');
+      }
+
+      directBtn.addEventListener('click', openDirect);
+      openDirectSetupBtn.addEventListener('click', openDirect);
+
+      fullscreenBtn.addEventListener('click', () => {
+        if (!document.fullscreenElement) {
+          document.documentElement.requestFullscreen?.();
+        } else {
+          document.exitFullscreen?.();
+        }
+      });
+
+      hideBarBtn.addEventListener('click', () => {
+        toolbar.classList.add('hidden');
+        restorePill.classList.add('visible');
+      });
+
+      restorePill.addEventListener('click', () => {
+        toolbar.classList.remove('hidden');
+        restorePill.classList.remove('visible');
+      });
+
+      // Listen for URL updates from the proxied page's injected runtime
+      window.addEventListener('message', (event) => {
+        if (event.data && event.data.type === 'proxy:location' && event.data.url) {
+          currentTarget = event.data.url;
+          if (document.activeElement !== urlInput) {
+            urlInput.value = currentTarget;
+          }
+        }
+      });
+
+      // Initialize from ?backend= query param or localStorage
+      const params = new URLSearchParams(window.location.search);
+      const queryTarget = params.get('url');
+      if (queryTarget) currentTarget = normalizeTarget(queryTarget);
+
+      const initialBackend = params.get('backend') || localStorage.getItem(STORAGE_KEY) || '';
+      if (initialBackend) {
+        backendInput.value = initialBackend;
+        connectBackend(initialBackend, true);
+      } else {
+        setStatus('', 'Not set');
+      }
+    })();
+  </script>
+</body>
+</html>

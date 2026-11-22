@@ -2,6 +2,8 @@ import {
   HEALTH_PATH,
   RUNTIME_PATH,
   CLIENT_RUNTIME_SCRIPT,
+  isStreamingMediaUrl,
+  isCookieFreeCdn,
   isStaticAssetUrl,
   resolveIncomingTargetUrl,
   extractProxiedTarget,
@@ -24,6 +26,7 @@ function corsHeaders(request) {
     'Access-Control-Allow-Credentials': reqOrigin ? 'true' : 'false',
     'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD',
     'Access-Control-Allow-Headers': request.headers.get('Access-Control-Request-Headers') || '*',
+    'Access-Control-Expose-Headers': '*',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };
@@ -194,9 +197,9 @@ export default {
       <button type="submit">Go</button>
     </form>
     <div class="quick">
+      <a class="btn" href="/https://www.youtube.com">▶ YouTube</a>
       <a class="btn" href="/https://www.chess.com/play">♟ Chess.com</a>
       <a class="btn" href="/https://www.chess.com/play/computer">🤖 Bots</a>
-      <a class="btn" href="/https://www.chess.com/puzzles">🧩 Puzzles</a>
       <a class="btn" href="/https://www.wikipedia.org">📚 Wikipedia</a>
     </div>
     <script>
@@ -233,9 +236,11 @@ export default {
     if (fetchUrl.protocol === 'ws:') fetchUrl.protocol = 'http:';
     if (fetchUrl.protocol === 'wss:') fetchUrl.protocol = 'https:';
 
-    // 7. Check Cloudflare Edge Cache for GET static assets
+    const isStreamingMedia = isStreamingMediaUrl(fetchUrl);
+
+    // 7. Check Cloudflare Edge Cache for GET static assets (never cache videoplayback streams)
     const isCacheableStatic =
-      request.method === 'GET' && !isWebSocket && isStaticAssetUrl(fetchUrl);
+      request.method === 'GET' && !isWebSocket && !isStreamingMedia && isStaticAssetUrl(fetchUrl);
     const edgeCache =
       isCacheableStatic && typeof caches !== 'undefined' && caches.default ? caches.default : null;
     const cacheKey = edgeCache ? new Request(url.href, { method: 'GET' }) : null;
@@ -249,16 +254,30 @@ export default {
       }
     }
 
-    // 9. Build upstream request headers
+    // 8. Build upstream request headers
     const newHeaders = new Headers(request.headers);
     newHeaders.set('Host', fetchUrl.host);
 
-    const upstreamOrigin = computeUpstreamOrigin(fetchUrl, refererHeader, explicitOrigin);
-    if (request.headers.has('Origin') || isWebSocket) {
+    const isGoogleVideo =
+      fetchUrl.hostname.toLowerCase() === 'googlevideo.com' ||
+      fetchUrl.hostname.toLowerCase().endsWith('.googlevideo.com');
+
+    const upstreamOrigin = isGoogleVideo
+      ? 'https://www.youtube.com'
+      : computeUpstreamOrigin(fetchUrl, refererHeader, explicitOrigin);
+
+    if (request.headers.has('Origin') || isWebSocket || isGoogleVideo) {
       newHeaders.set('Origin', upstreamOrigin);
     }
 
-    if (refererHeader) {
+    // Rewrite YouTube InnerTube X-Origin header so API requests match upstream origin
+    if (newHeaders.has('x-origin')) {
+      newHeaders.set('x-origin', upstreamOrigin);
+    }
+
+    if (isGoogleVideo) {
+      newHeaders.set('Referer', 'https://www.youtube.com/');
+    } else if (refererHeader) {
       const refTarget = extractProxiedTarget(refererHeader);
       newHeaders.set('Referer', refTarget ? refTarget.href : fetchUrl.origin + '/');
     }
@@ -273,8 +292,8 @@ export default {
     newHeaders.delete('x-forwarded-proto');
     newHeaders.delete('x-real-ip');
 
-    // Strip cookies on static CDN assets to maximize edge cache hits & reduce upstream payload
-    if (isCacheableStatic && fetchUrl.hostname.toLowerCase().endsWith('chesscomfiles.com')) {
+    // Strip cookies on public static CDNs (ytimg, ggpht, chesscomfiles, gstatic) for max edge cache hits
+    if (isCacheableStatic && isCookieFreeCdn(fetchUrl.hostname)) {
       newHeaders.delete('cookie');
     }
 

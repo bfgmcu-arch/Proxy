@@ -7,6 +7,8 @@ import worker from '../src/index.js';
 import { createProxyServer } from '../server.js';
 import {
   RUNTIME_PATH,
+  isStreamingMediaUrl,
+  isCookieFreeCdn,
   isStaticAssetUrl,
   normalizeTargetUrl,
   resolveIncomingTargetUrl,
@@ -140,6 +142,79 @@ test('Cloudflare Worker fast paths: health, immutable runtime, all websites allo
     assert.equal(capturedInit.cf.cacheEverything, true);
     assert.equal(capturedInit.cf.cacheTtl, 86400);
     assert.match(assetResp.headers.get('cache-control'), /max-age=86400/);
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('YouTube optimizations: googlevideo Range/206 zero-copy streaming, InnerTube X-Origin, ytimg CDN caching', async () => {
+  // Helper classification checks
+  assert.equal(isStreamingMediaUrl(new URL('https://rr1---sn-abc.googlevideo.com/videoplayback?itag=251')), true);
+  assert.equal(isStaticAssetUrl(new URL('https://rr1---sn-abc.googlevideo.com/videoplayback?itag=251')), false);
+  assert.equal(isStaticAssetUrl(new URL('https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg')), true);
+  assert.equal(isStaticAssetUrl(new URL('https://www.youtube.com/s/player/abc123/base.js')), true);
+  assert.equal(isCookieFreeCdn('i.ytimg.com'), true);
+  assert.equal(isCookieFreeCdn('yt3.ggpht.com'), true);
+
+  const origFetch = globalThis.fetch;
+  let capturedUrl = null;
+  let capturedInit = null;
+
+  globalThis.fetch = async (u, init) => {
+    capturedUrl = u;
+    capturedInit = init;
+    if (u.includes('googlevideo.com')) {
+      return new Response(new Uint8Array([0, 1, 2, 3]), {
+        status: 206,
+        headers: {
+          'Content-Type': 'video/webm',
+          'Content-Range': 'bytes 0-3/1000',
+          'Accept-Ranges': 'bytes',
+          'X-Head-Time-Millis': '12345',
+        },
+      });
+    }
+    return new Response(JSON.stringify({ playabilityStatus: { status: 'OK' } }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  try {
+    // 1. googlevideo.com: zero-copy 206 Range stream, no cf cache, YouTube Origin/Referer, Expose-Headers: *
+    const gvResp = await worker.fetch(
+      new Request('https://my-proxy.workers.dev/https://rr1---sn-abc.googlevideo.com/videoplayback?itag=251', {
+        headers: { Range: 'bytes=0-3' },
+      }),
+      {},
+      { waitUntil() {} }
+    );
+    assert.equal(gvResp.status, 206);
+    assert.equal(capturedInit.cf, undefined);
+    assert.equal(capturedInit.headers.get('origin'), 'https://www.youtube.com');
+    assert.equal(capturedInit.headers.get('referer'), 'https://www.youtube.com/');
+    assert.equal(capturedInit.headers.get('range'), 'bytes=0-3');
+    assert.equal(gvResp.headers.get('content-range'), 'bytes 0-3/1000');
+    assert.equal(gvResp.headers.get('access-control-expose-headers'), '*');
+
+    // 2. InnerTube POST: X-Origin rewritten to https://www.youtube.com
+    const apiResp = await worker.fetch(
+      new Request('https://my-proxy.workers.dev/https://www.youtube.com/youtubei/v1/player', {
+        method: 'POST',
+        headers: {
+          Origin: 'https://my-proxy.workers.dev',
+          'X-Origin': 'https://my-proxy.workers.dev',
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ videoId: 'dQw4w9WgXcQ' }),
+      }),
+      {},
+      { waitUntil() {} }
+    );
+    assert.equal(apiResp.status, 200);
+    assert.equal(capturedUrl, 'https://www.youtube.com/youtubei/v1/player');
+    assert.equal(capturedInit.headers.get('x-origin'), 'https://www.youtube.com');
+    assert.equal(capturedInit.headers.get('origin'), 'https://www.youtube.com');
   } finally {
     globalThis.fetch = origFetch;
   }

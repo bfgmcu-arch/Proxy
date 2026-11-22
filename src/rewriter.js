@@ -11,12 +11,50 @@ const SKIP_PROTOCOLS = /^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
 const STATIC_EXT_RE =
   /\.(?:js|mjs|css|wasm|png|jpe?g|webp|gif|svg|ico|woff2?|ttf|otf|eot|mp3|ogg|wav|webm|avif)(?:$|\?)/i;
 
+const COOKIE_FREE_CDNS = [
+  'chesscomfiles.com',
+  'ytimg.com',
+  'ggpht.com',
+  'fonts.gstatic.com',
+];
+
 /**
- * Determine whether a target URL is a cacheable static asset (Chess.com CDN or static extension).
+ * Detect live/range-based media streams (e.g. YouTube googlevideo.com/videoplayback)
+ * that must be streamed zero-copy without edge caching.
+ */
+export function isStreamingMediaUrl(targetUrl) {
+  const host = targetUrl.hostname.toLowerCase();
+  if (host === 'googlevideo.com' || host.endsWith('.googlevideo.com')) {
+    return true;
+  }
+  const p = targetUrl.pathname.toLowerCase();
+  return p.includes('/videoplayback') || /\.(?:m3u8|mpd|m4s|ts)(?:$|\?)/.test(p);
+}
+
+/**
+ * Detect public static CDNs where stripping cookies maximizes Cloudflare edge cache hits.
+ */
+export function isCookieFreeCdn(hostname) {
+  if (!hostname) return false;
+  const h = hostname.toLowerCase();
+  for (let i = 0; i < COOKIE_FREE_CDNS.length; i++) {
+    const cdn = COOKIE_FREE_CDNS[i];
+    if (h === cdn || h.endsWith('.' + cdn)) return true;
+  }
+  return false;
+}
+
+/**
+ * Determine whether a target URL is a cacheable static asset (never caches videoplayback streams).
  */
 export function isStaticAssetUrl(targetUrl) {
+  if (isStreamingMediaUrl(targetUrl)) return false;
   const host = targetUrl.hostname.toLowerCase();
-  if (host === 'chesscomfiles.com' || host.endsWith('.chesscomfiles.com')) {
+  if (isCookieFreeCdn(host)) return true;
+  if (
+    (host === 'www.youtube.com' || host === 'm.youtube.com') &&
+    (targetUrl.pathname.startsWith('/s/player/') || targetUrl.pathname.startsWith('/s/desktop/'))
+  ) {
     return true;
   }
   return STATIC_EXT_RE.test(targetUrl.pathname);
@@ -258,8 +296,11 @@ function rwSrcset(v){
   if(typeof v!=='string')return v;
   return v.split(',').map(function(p){var t=p.trim();if(!t)return p;var i=t.search(/\\s/);if(i===-1)return rwHttp(t);return rwHttp(t.slice(0,i))+t.slice(i);}).join(', ');
 }
+var oReq=window.Request;
+if(oReq){var PReq=function(i,o){if(typeof i==='string'||i instanceof URL){i=rwHttp(String(i));}return arguments.length>1?new oReq(i,o):new oReq(i);};PReq.prototype=oReq.prototype;window.Request=PReq;}
 var oF=window.fetch;
-if(oF){window.fetch=function(a,b){try{if(typeof a==='string'||a instanceof URL){a=rwHttp(String(a));}else if(a instanceof Request){var n2=rwHttp(a.url);if(n2!==a.url)a=new Request(n2,a);}}catch(e){}return oF.call(this,a,b);};}
+if(oF){window.fetch=function(a,b){try{if(typeof a==='string'||a instanceof URL){a=rwHttp(String(a));}else if(a instanceof oReq){var n2=rwHttp(a.url);if(n2!==a.url)a=new oReq(n2,a);}}catch(e){}return oF.call(this,a,b);};}
+try{if(navigator&&navigator.serviceWorker&&navigator.serviceWorker.register){navigator.serviceWorker.register=function(){return Promise.reject(new DOMException('ServiceWorker disabled in proxy','SecurityError'));};}}catch(e){}
 var oXO=XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open=function(m,u){var a=Array.prototype.slice.call(arguments);if(typeof u==='string'||u instanceof URL){a[1]=rwHttp(String(u));}return oXO.apply(this,a);};
 var oWS=window.WebSocket;

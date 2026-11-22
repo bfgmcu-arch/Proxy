@@ -6,7 +6,9 @@ import crypto from 'node:crypto';
 import worker from '../src/index.js';
 import { createProxyServer } from '../server.js';
 import {
+  PREFIX,
   RUNTIME_PATH,
+  SW_PATH,
   isStreamingMediaUrl,
   isCookieFreeCdn,
   isStaticAssetUrl,
@@ -32,9 +34,12 @@ test('isStaticAssetUrl detects Chess.com CDN and static file extensions', () => 
   assert.equal(isStaticAssetUrl(new URL('https://www.chess.com/callback/user/popup')), false);
 });
 
-test('resolveIncomingTargetUrl resolves root-relative paths via Referer against origin', () => {
+test('resolveIncomingTargetUrl resolves /----- prefix and root-relative paths via Referer', () => {
+  const direct = resolveIncomingTargetUrl(new URL(`https://proxy.example${PREFIX}https://www.youtube.com/watch?v=1`), null);
+  assert.equal(direct.targetUrl.href, 'https://www.youtube.com/watch?v=1');
+
   const reqUrl = new URL('https://proxy.example/callback/user/popup?v=1');
-  const referer = 'https://proxy.example/https://www.chess.com/play/online';
+  const referer = `https://proxy.example${PREFIX}https://www.chess.com/play/online`;
   const res = resolveIncomingTargetUrl(reqUrl, referer);
   assert.equal(res.targetUrl.href, 'https://www.chess.com/callback/user/popup?v=1');
 });
@@ -49,7 +54,7 @@ test('rewriteSetCookie strips Domain, normalizes Path, and sets SameSite=None; S
   assert.match(rewritten, /HttpOnly/);
 });
 
-test('rewriteHtml rewrites URLs, strips CSP/integrity, and injects static cached runtime script', () => {
+test('rewriteHtml rewrites URLs with /----- prefix, strips CSP/integrity, and injects runtime script', () => {
   const html = `<!DOCTYPE html>
 <html>
 <head>
@@ -67,11 +72,11 @@ test('rewriteHtml rewrites URLs, strips CSP/integrity, and injects static cached
   assert.doesNotMatch(out, /Content-Security-Policy/i);
   assert.doesNotMatch(out, /integrity=/i);
   assert.match(out, /<script src="https:\/\/proxy\.example\/__proxy_runtime\.js"><\/script>/);
-  assert.match(out, /href="https:\/\/proxy\.example\/https:\/\/www\.chess\.com\/bundles\/app\.css"/);
-  assert.match(out, /url\('https:\/\/proxy\.example\/https:\/\/www\.chess\.com\/img\/board\.png'\)/);
-  assert.match(out, /src="https:\/\/proxy\.example\/https:\/\/images\.chesscomfiles\.com\/piece\.png"/);
-  assert.match(out, /src="https:\/\/proxy\.example\/https:\/\/betacssjs\.chesscomfiles\.com\/app\.js"/);
-  assert.match(out, /srcset="https:\/\/proxy\.example\/https:\/\/www\.chess\.com\/a\.png 1x, https:\/\/proxy\.example\/https:\/\/cdn\.chess\.com\/b\.png 2x"/);
+  assert.match(out, /href="https:\/\/proxy\.example\/-----https:\/\/www\.chess\.com\/bundles\/app\.css"/);
+  assert.match(out, /url\('https:\/\/proxy\.example\/-----https:\/\/www\.chess\.com\/img\/board\.png'\)/);
+  assert.match(out, /src="https:\/\/proxy\.example\/-----https:\/\/images\.chesscomfiles\.com\/piece\.png"/);
+  assert.match(out, /src="https:\/\/proxy\.example\/-----https:\/\/betacssjs\.chesscomfiles\.com\/app\.js"/);
+  assert.match(out, /srcset="https:\/\/proxy\.example\/-----https:\/\/www\.chess\.com\/a\.png 1x, https:\/\/proxy\.example\/-----https:\/\/cdn\.chess\.com\/b\.png 2x"/);
 });
 
 test('rewriteCss rewrites url() and @import rules and fast-exits when none present', () => {
@@ -80,8 +85,8 @@ test('rewriteCss rewrites url() and @import rules and fast-exits when none prese
 
   const css = `@import "/fonts.css"; .k { background: url('../pieces/wk.svg'); }`;
   const out = rewriteCss(css, 'https://www.chess.com/css/theme.css', 'https://proxy.example');
-  assert.match(out, /@import "https:\/\/proxy\.example\/https:\/\/www\.chess\.com\/fonts\.css"/);
-  assert.match(out, /url\('https:\/\/proxy\.example\/https:\/\/www\.chess\.com\/pieces\/wk\.svg'\)/);
+  assert.match(out, /@import "https:\/\/proxy\.example\/-----https:\/\/www\.chess\.com\/fonts\.css"/);
+  assert.match(out, /url\('https:\/\/proxy\.example\/-----https:\/\/www\.chess\.com\/pieces\/wk\.svg'\)/);
 });
 
 test('stripInternalParams extracts __proxy_origin cleanly', () => {
@@ -100,7 +105,21 @@ test('Cloudflare Worker fast paths: health, immutable runtime, all websites allo
   assert.equal(hJson.ok, true);
   assert.equal(hJson.runtime, 'cloudflare-worker');
 
-  // 2. Static immutable runtime script
+  // 2. Service Worker script & bootstrapper
+  const sw = await worker.fetch(new Request(`https://my-proxy.workers.dev${SW_PATH}`), {}, {});
+  assert.equal(sw.status, 200);
+  assert.equal(sw.headers.get('service-worker-allowed'), '/');
+  assert.match(await sw.text(), /addEventListener\('fetch'/);
+
+  const go = await worker.fetch(
+    new Request('https://my-proxy.workers.dev/__proxy_go?url=https%3A%2F%2Fwww.youtube.com'),
+    {},
+    {}
+  );
+  assert.equal(go.status, 200);
+  assert.match(await go.text(), /\/__proxy_sw\.js/);
+
+  // 3. Static immutable runtime script
   const rt = await worker.fetch(new Request(`https://my-proxy.workers.dev${RUNTIME_PATH}`), {}, {});
   assert.equal(rt.status, 200);
   assert.match(rt.headers.get('cache-control'), /immutable/);
@@ -323,11 +342,11 @@ test('end-to-end HTTP, gzip, multi-Set-Cookie, redirect, and WebSocket proxying'
 
     const pageHtml = await pageResp.text();
     assert.match(pageHtml, /__proxy_runtime\.js/);
-    assert.match(pageHtml, new RegExp(`href="https://127\\.0\\.0\\.1:${proxyPort}/${upstreamBase}/game"`));
+    assert.match(pageHtml, new RegExp(`href="https://127\\.0\\.0\\.1:${proxyPort}/-----${upstreamBase}/game"`));
 
     const redirResp = await fetch(`${proxyBase}/${upstreamBase}/redirect`, { redirect: 'manual' });
     assert.equal(redirResp.status, 302);
-    assert.equal(redirResp.headers.get('location'), `${proxyBase}/${upstreamBase}/play`);
+    assert.equal(redirResp.headers.get('location'), `${proxyBase}${PREFIX}${upstreamBase}/play`);
 
     const wsUrl = `ws://127.0.0.1:${proxyPort}/ws://127.0.0.1:${upstreamPort}/cometd?__proxy_origin=${encodeURIComponent('https://www.chess.com')}`;
     const echoed = await new Promise((resolve, reject) => {

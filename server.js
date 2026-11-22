@@ -3,9 +3,12 @@ import net from 'net';
 import tls from 'tls';
 import { URL } from 'url';
 import {
+  PREFIX,
   HEALTH_PATH,
   RUNTIME_PATH,
+  SW_PATH,
   CLIENT_RUNTIME_SCRIPT,
+  SERVICE_WORKER_SCRIPT,
   resolveIncomingTargetUrl,
   extractProxiedTarget,
   rewriteHtml,
@@ -66,6 +69,17 @@ export function createProxyServer() {
           ...getCorsHeaders(req),
         });
         return res.end(JSON.stringify({ ok: true, runtime: 'node', websockets: true }));
+      }
+
+      // Service Worker script
+      if (url.pathname === SW_PATH) {
+        res.writeHead(200, {
+          'content-type': 'application/javascript; charset=utf-8',
+          'service-worker-allowed': '/',
+          'cache-control': 'public, max-age=3600',
+          ...getCorsHeaders(req),
+        });
+        return res.end(SERVICE_WORKER_SCRIPT);
       }
 
       // Static browser-cacheable client runtime
@@ -228,7 +242,7 @@ export function createProxyServer() {
         if (location) {
           try {
             const redirectUrl = new URL(location, targetUrl.href);
-            responseHeaders['location'] = `${proxyBase}/${redirectUrl.href}`;
+            responseHeaders['location'] = `${proxyBase}${PREFIX}${redirectUrl.href}`;
           } catch {
             // ignore
           }

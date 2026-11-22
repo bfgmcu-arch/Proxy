@@ -495,7 +495,7 @@
         }
         currentTarget = normalizeTarget(targetUrl);
         urlInput.value = currentTarget;
-        iframe.src = backendUrl + '/' + currentTarget;
+        iframe.src = backendUrl + '/__proxy_go?url=' + encodeURIComponent(currentTarget);
       }
 
       async function connectBackend(rawUrl, autoLoad) {
@@ -572,7 +572,7 @@
           overlay.classList.remove('hidden');
           return;
         }
-        window.open(backendUrl + '/' + currentTarget, '_blank', 'noopener');
+        window.open(backendUrl + '/__proxy_go?url=' + encodeURIComponent(currentTarget), '_blank', 'noopener');
       }
 
       directBtn.addEventListener('click', openDirect);

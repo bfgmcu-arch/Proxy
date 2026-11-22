@@ -1,7 +1,10 @@
 import {
+  PREFIX,
   HEALTH_PATH,
   RUNTIME_PATH,
+  SW_PATH,
   CLIENT_RUNTIME_SCRIPT,
+  SERVICE_WORKER_SCRIPT,
   isStreamingMediaUrl,
   isCookieFreeCdn,
   isStaticAssetUrl,
@@ -99,9 +102,11 @@ function streamRewriteHtml(response, baseUrl, proxyBase) {
       text(chunk) {
         styleBuf += chunk.text;
         if (chunk.lastInTextNode) {
-          if (styleBuf.indexOf('url(') !== -1 || styleBuf.indexOf('@import') !== -1) {
-            chunk.replace(rewriteCss(styleBuf, baseUrl, proxyBase));
-          }
+          const out =
+            styleBuf.indexOf('url(') !== -1 || styleBuf.indexOf('@import') !== -1
+              ? rewriteCss(styleBuf, baseUrl, proxyBase)
+              : styleBuf;
+          chunk.replace(out);
           styleBuf = '';
         } else {
           chunk.remove();
@@ -110,6 +115,45 @@ function streamRewriteHtml(response, baseUrl, proxyBase) {
     });
 
   return rewriter.transform(response);
+}
+
+/**
+ * Render a tiny bootstrapper page that ensures /__proxy_sw.js is registered & active
+ * before navigating to the proxied site (jsproxy pattern).
+ */
+function renderSwBootstrapPage(targetUrl) {
+  const safeTarget = JSON.stringify(PREFIX + targetUrl);
+  return new Response(
+    `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Loading…</title>
+  <style>body{background:#161512;color:#ecebe8;font-family:system-ui,sans-serif;display:grid;place-items:center;height:100vh;margin:0;}</style>
+</head>
+<body>
+  <p id="s">Starting proxy service worker…</p>
+  <script>
+    (async function () {
+      var dest = ${safeTarget};
+      try {
+        if ('serviceWorker' in navigator) {
+          await navigator.serviceWorker.register('${SW_PATH}', { scope: '/' });
+          await navigator.serviceWorker.ready;
+        }
+      } catch (e) {}
+      location.replace(dest);
+    })();
+  </script>
+</body>
+</html>`,
+    {
+      headers: {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+      },
+    }
+  );
 }
 
 export default {
@@ -141,6 +185,7 @@ export default {
           ok: true,
           runtime: 'cloudflare-worker',
           websockets: true,
+          serviceWorker: true,
           streamingHtml: typeof HTMLRewriter !== 'undefined',
         }),
         {
@@ -153,7 +198,20 @@ export default {
       );
     }
 
-    // 4. Fast path: Static cached client runtime (0 upstream fetch, browser-cached 24h)
+    // 4. Fast path: Service Worker script (jsproxy-style full network interception)
+    if (url.pathname === SW_PATH) {
+      return new Response(SERVICE_WORKER_SCRIPT, {
+        status: 200,
+        headers: {
+          'Content-Type': 'application/javascript; charset=utf-8',
+          'Service-Worker-Allowed': '/',
+          'Cache-Control': 'public, max-age=3600',
+          ...corsHeaders(request),
+        },
+      });
+    }
+
+    // 5. Fast path: Static cached client runtime
     if (url.pathname === RUNTIME_PATH) {
       return new Response(CLIENT_RUNTIME_SCRIPT, {
         status: 200,
@@ -165,7 +223,14 @@ export default {
       });
     }
 
-    // 5. Root launcher UI
+    // 6. Fast path: Service Worker bootstrapper (/ __proxy_go?url=...)
+    if (url.pathname === '/__proxy_go' && url.searchParams.has('url')) {
+      let dest = (url.searchParams.get('url') || '').trim();
+      if (!/^https?:\/\//i.test(dest)) dest = 'https://' + dest;
+      return renderSwBootstrapPage(dest);
+    }
+
+    // 7. Root launcher UI (registers Service Worker before navigating!)
     if (url.pathname === '/' && !url.searchParams.has('url')) {
       return new Response(
         `<!DOCTYPE html>
@@ -186,28 +251,56 @@ export default {
     .quick { display: flex; gap: 0.5rem; flex-wrap: wrap; }
     .quick a.btn { background: #33302c; color: #ecebe8; font-size: 0.84rem; font-weight: 600; border: 1px solid #3a3733; }
     .quick a.btn:hover { background: #403d38; }
+    .sw-status { margin-top: 0.85rem; font-size: 0.78rem; color: #81b64c; }
   </style>
 </head>
 <body>
   <div class="container">
     <h2>🌐 Cloudflare Web Proxy</h2>
-    <p>All Websites Allowed • Streaming HTMLRewriter • WebSockets • Edge Asset Cache</p>
+    <p>All Websites • Service Worker Engine • YouTube &amp; Chess.com Ready</p>
     <form action="/" method="GET" id="proxy-form">
-      <input type="text" name="url" placeholder="Enter any URL (e.g. https://www.chess.com/play)" required>
+      <input type="text" name="url" placeholder="Enter any URL (e.g. https://www.youtube.com)" required>
       <button type="submit">Go</button>
     </form>
     <div class="quick">
-      <a class="btn" href="/https://www.youtube.com">▶ YouTube</a>
-      <a class="btn" href="/https://www.chess.com/play">♟ Chess.com</a>
-      <a class="btn" href="/https://www.chess.com/play/computer">🤖 Bots</a>
-      <a class="btn" href="/https://www.wikipedia.org">📚 Wikipedia</a>
+      <a class="btn" data-url="https://www.youtube.com" href="/__proxy_go?url=https%3A%2F%2Fwww.youtube.com">▶ YouTube</a>
+      <a class="btn" data-url="https://www.chess.com/play" href="/__proxy_go?url=https%3A%2F%2Fwww.chess.com%2Fplay">♟ Chess.com</a>
+      <a class="btn" data-url="https://www.wikipedia.org" href="/__proxy_go?url=https%3A%2F%2Fwww.wikipedia.org">📚 Wikipedia</a>
     </div>
+    <div class="sw-status" id="sw-status">Initializing Service Worker…</div>
     <script>
+      var swReady = (async function () {
+        var el = document.getElementById('sw-status');
+        try {
+          if ('serviceWorker' in navigator) {
+            await navigator.serviceWorker.register('${SW_PATH}', { scope: '/' });
+            await navigator.serviceWorker.ready;
+            el.textContent = '✓ Service Worker active — ready for YouTube & all sites';
+          } else {
+            el.textContent = 'Service Worker unavailable (using fallback mode)';
+          }
+        } catch (e) {
+          el.textContent = 'Service Worker fallback mode';
+        }
+      })();
+
+      async function go(targetUrl) {
+        await swReady;
+        targetUrl = targetUrl.trim();
+        if (!/^https?:\\/\\//i.test(targetUrl)) targetUrl = 'https://' + targetUrl;
+        window.location.href = '${PREFIX}' + targetUrl;
+      }
+
       document.getElementById('proxy-form').addEventListener('submit', function(e) {
         e.preventDefault();
-        var targetUrl = document.querySelector('input[name="url"]').value.trim();
-        if (!/^https?:\\/\\//i.test(targetUrl)) targetUrl = 'https://' + targetUrl;
-        window.location.href = '/' + targetUrl;
+        go(document.querySelector('input[name="url"]').value);
+      });
+
+      document.querySelectorAll('.quick a[data-url]').forEach(function(a) {
+        a.addEventListener('click', function(e) {
+          e.preventDefault();
+          go(a.getAttribute('data-url'));
+        });
       });
     </script>
   </div>
@@ -216,13 +309,13 @@ export default {
         {
           headers: {
             'Content-Type': 'text/html; charset=utf-8',
-            'Cache-Control': 'public, max-age=3600',
+            'Cache-Control': 'public, max-age=600',
           },
         }
       );
     }
 
-    // 6. Resolve target URL
+    // 8. Resolve target URL
     const refererHeader = request.headers.get('Referer');
     const resolved = resolveIncomingTargetUrl(url, refererHeader);
     if (resolved.error) {
@@ -238,7 +331,7 @@ export default {
 
     const isStreamingMedia = isStreamingMediaUrl(fetchUrl);
 
-    // 7. Check Cloudflare Edge Cache for GET static assets (never cache videoplayback streams)
+    // 9. Check Cloudflare Edge Cache for GET static assets (never cache videoplayback streams)
     const isCacheableStatic =
       request.method === 'GET' && !isWebSocket && !isStreamingMedia && isStaticAssetUrl(fetchUrl);
     const edgeCache =
@@ -254,13 +347,15 @@ export default {
       }
     }
 
-    // 8. Build upstream request headers
+    // 10. Build upstream request headers
     const newHeaders = new Headers(request.headers);
     newHeaders.set('Host', fetchUrl.host);
 
+    const hostLower = fetchUrl.hostname.toLowerCase();
     const isGoogleVideo =
-      fetchUrl.hostname.toLowerCase() === 'googlevideo.com' ||
-      fetchUrl.hostname.toLowerCase().endsWith('.googlevideo.com');
+      hostLower === 'googlevideo.com' || hostLower.endsWith('.googlevideo.com');
+    const isYouTube =
+      hostLower === 'youtube.com' || hostLower.endsWith('.youtube.com');
 
     const upstreamOrigin = isGoogleVideo
       ? 'https://www.youtube.com'
@@ -282,6 +377,17 @@ export default {
       newHeaders.set('Referer', refTarget ? refTarget.href : fetchUrl.origin + '/');
     }
 
+    // Prevent YouTube GDPR consent wall on European/cloud Cloudflare PoPs
+    if (isYouTube) {
+      const existingCookie = newHeaders.get('cookie') || '';
+      if (!existingCookie.includes('CONSENT=')) {
+        newHeaders.set(
+          'cookie',
+          existingCookie ? `${existingCookie}; CONSENT=YES+cb` : 'CONSENT=YES+cb'
+        );
+      }
+    }
+
     // Strip proxy/CF identifying headers
     newHeaders.delete('cf-connecting-ip');
     newHeaders.delete('cf-ipcountry');
@@ -297,7 +403,7 @@ export default {
       newHeaders.delete('cookie');
     }
 
-    // 10. WebSocket passthrough (Chess.com live games)
+    // 11. WebSocket passthrough
     if (isWebSocket) {
       try {
         const wsResp = await fetch(fetchUrl.href, { headers: newHeaders });
@@ -310,7 +416,7 @@ export default {
       }
     }
 
-    // 11. Fetch upstream (enable Cloudflare edge caching for static assets)
+    // 12. Fetch upstream (enable Cloudflare edge caching for static assets only)
     const fetchInit = {
       method: request.method,
       headers: newHeaders,
@@ -355,13 +461,13 @@ export default {
       }
     }
 
-    // Rewrite redirects
+    // Rewrite redirects to stay on /-----<url>
     if ([301, 302, 303, 307, 308].includes(response.status)) {
       const location = responseHeaders.get('location');
       if (location) {
         try {
           const redirectUrl = new URL(location, fetchUrl.href);
-          responseHeaders.set('location', `${proxyBase}/${redirectUrl.href}`);
+          responseHeaders.set('location', `${proxyBase}${PREFIX}${redirectUrl.href}`);
         } catch {
           // ignore
         }
@@ -383,7 +489,7 @@ export default {
 
     const contentType = (responseHeaders.get('content-type') || '').toLowerCase();
 
-    // 12. Streaming HTML rewriting via native Cloudflare HTMLRewriter
+    // 13. Streaming HTML rewriting via native Cloudflare HTMLRewriter
     if (contentType.includes('text/html')) {
       responseHeaders.delete('content-encoding');
       responseHeaders.delete('content-length');
@@ -404,7 +510,7 @@ export default {
       });
     }
 
-    // 13. Size-guarded fast CSS rewriting (cached after first rewrite)
+    // 14. Size-guarded fast CSS rewriting (cached after first rewrite)
     if (contentType.includes('text/css')) {
       const contentLen = Number(responseHeaders.get('content-length') || '0');
       if (contentLen <= MAX_CSS_REWRITE_BYTES) {
@@ -424,7 +530,7 @@ export default {
       }
     }
 
-    // 14. Zero-copy streaming for all other assets (JS, WASM, PNG, SVG, MP3, JSON, fonts)
+    // 15. Zero-copy streaming for all other assets (googlevideo.com, JS, WASM, PNG, SVG, MP3, JSON, fonts)
     const outResp = new Response(response.body, {
       status: response.status,
       statusText: response.statusText,

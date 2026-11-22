@@ -1,9 +1,12 @@
 /**
- * Ultra-lightweight shared proxy utilities optimized for Cloudflare Workers Free Tier
- * (10ms CPU limit, 128MB memory, 100k req/day).
+ * Shared proxy utilities combining jsproxy's Service Worker architecture
+ * with Cloudflare Workers Free Tier optimizations (streaming HTMLRewriter,
+ * edge/browser caching, zero-copy media streaming, and WebSocket passthrough).
  */
 
+export const PREFIX = '/-----';
 export const RUNTIME_PATH = '/__proxy_runtime.js';
+export const SW_PATH = '/__proxy_sw.js';
 export const HEALTH_PATH = '/__proxy_health';
 
 const SKIP_PROTOCOLS = /^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
@@ -61,11 +64,21 @@ export function isStaticAssetUrl(targetUrl) {
 }
 
 /**
- * Fix collapsed protocol slashes (e.g. https:/www.chess.com -> https://www.chess.com).
+ * Fix collapsed protocol slashes (e.g. https:/www.youtube.com -> https://www.youtube.com).
  */
 export function normalizeTargetUrl(raw) {
   if (!raw) return '';
   return raw.replace(/^(https?|wss?):\/(?!\/)/i, '$1://');
+}
+
+/**
+ * Strip the proxy prefix (/----- or /) from a pathname to get the raw target URL string.
+ */
+function stripProxyPrefix(pathname) {
+  if (pathname.startsWith(PREFIX)) {
+    return pathname.substring(PREFIX.length);
+  }
+  return pathname.substring(1);
 }
 
 /**
@@ -74,7 +87,7 @@ export function normalizeTargetUrl(raw) {
 export function extractProxiedTarget(proxiedUrlStr) {
   try {
     const parsed = new URL(proxiedUrlStr);
-    const raw = normalizeTargetUrl(parsed.pathname.substring(1) + parsed.search);
+    const raw = normalizeTargetUrl(stripProxyPrefix(parsed.pathname) + parsed.search);
     if (/^(https?|wss?):\/\//i.test(raw)) {
       return new URL(raw);
     }
@@ -89,6 +102,7 @@ export function extractProxiedTarget(proxiedUrlStr) {
 
 /**
  * Resolve an incoming request URL into a target URL object.
+ * Supports /-----https://..., /https://..., /?url=..., and Referer fallback.
  */
 export function resolveIncomingTargetUrl(requestUrl, refererHeader) {
   let targetUrlStr = '';
@@ -96,7 +110,7 @@ export function resolveIncomingTargetUrl(requestUrl, refererHeader) {
   if (requestUrl.pathname === '/' && requestUrl.searchParams.has('url')) {
     targetUrlStr = normalizeTargetUrl(requestUrl.searchParams.get('url') || '');
   } else {
-    targetUrlStr = normalizeTargetUrl(requestUrl.pathname.substring(1) + requestUrl.search);
+    targetUrlStr = normalizeTargetUrl(stripProxyPrefix(requestUrl.pathname) + requestUrl.search);
   }
 
   if (!targetUrlStr) {
@@ -128,28 +142,31 @@ export function resolveIncomingTargetUrl(requestUrl, refererHeader) {
 }
 
 /**
- * Rewrite a single URL (absolute, protocol-relative, or relative) to go through proxyBase.
+ * Rewrite a single URL (absolute, protocol-relative, or relative) to go through proxyBase + PREFIX.
  */
 export function rewriteUrl(rawUrl, baseUrl, proxyBase) {
   if (!rawUrl) return rawUrl;
   const trimmed = rawUrl.trim();
   if (!trimmed || SKIP_PROTOCOLS.test(trimmed)) return rawUrl;
 
-  if (trimmed.startsWith(proxyBase + '/http') || trimmed.startsWith(proxyBase + '/ws')) {
-    return rawUrl;
-  }
-  if (/^\/(https?|wss?):\/\//i.test(trimmed)) {
+  if (
+    trimmed.startsWith(proxyBase + PREFIX) ||
+    trimmed.startsWith(PREFIX) ||
+    trimmed.startsWith(proxyBase + '/http') ||
+    trimmed.startsWith(proxyBase + '/ws') ||
+    /^\/(https?|wss?):\/\//i.test(trimmed)
+  ) {
     return rawUrl;
   }
 
   try {
     const resolved = new URL(trimmed, baseUrl);
     if (resolved.protocol === 'http:' || resolved.protocol === 'https:') {
-      return `${proxyBase}/${resolved.href}`;
+      return `${proxyBase}${PREFIX}${resolved.href}`;
     }
     if (resolved.protocol === 'ws:' || resolved.protocol === 'wss:') {
       const wsProxyBase = proxyBase.replace(/^http/i, 'ws');
-      return `${wsProxyBase}/${resolved.href}`;
+      return `${wsProxyBase}${PREFIX}${resolved.href}`;
     }
   } catch {
     // leave untouched
@@ -254,41 +271,163 @@ export function rewriteSetCookie(cookieHeader, isHttpsProxy) {
 }
 
 /**
+ * jsproxy-inspired Service Worker served at /__proxy_sw.js.
+ * Intercepts 100% of browser network requests (fetch, XHR, import(), media,
+ * YouTube googlevideo.com streams, InnerTube API, images, scripts, workers)
+ * right in the browser — zero extra CPU on Cloudflare Workers!
+ */
+export const SERVICE_WORKER_SCRIPT = `const PREFIX = '${PREFIX}';
+
+self.addEventListener('install', () => {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
+function extractTargetFromClientUrl(clientUrl) {
+  try {
+    const u = new URL(clientUrl);
+    let raw = u.pathname.startsWith(PREFIX)
+      ? u.pathname.substring(PREFIX.length) + u.search
+      : u.pathname.substring(1) + u.search;
+    raw = raw.replace(/^(https?|wss?):\\/(?!\\/)/i, '$1://');
+    if (/^https?:\\/\\//i.test(raw)) return new URL(raw);
+  } catch (e) {}
+  return null;
+}
+
+self.addEventListener('fetch', (event) => {
+  const req = event.request;
+  let reqUrl;
+  try {
+    reqUrl = new URL(req.url);
+  } catch (e) {
+    return;
+  }
+
+  if (reqUrl.protocol !== 'http:' && reqUrl.protocol !== 'https:') {
+    return;
+  }
+
+  const isSameOrigin = reqUrl.origin === self.location.origin;
+
+  // Let internal proxy routes and already-prefixed URLs go straight to the Worker
+  if (isSameOrigin) {
+    const p = reqUrl.pathname;
+    if (
+      p === '/' ||
+      p.startsWith('/__proxy_') ||
+      p.startsWith(PREFIX) ||
+      /^\\/(https?|wss?):\\/\\//i.test(p)
+    ) {
+      return;
+    }
+  }
+
+  event.respondWith((async () => {
+    let targetHref = null;
+
+    if (!isSameOrigin) {
+      // Cross-origin request (e.g. googlevideo.com, ytimg.com, chesscomfiles.com)
+      targetHref = reqUrl.href;
+    } else {
+      // Same-origin root-relative request (e.g. /youtubei/v1/player, /s/desktop/..., /callback/...)
+      let client = null;
+      if (event.clientId) {
+        client = await self.clients.get(event.clientId);
+      }
+      if (!client && event.resultingClientId) {
+        client = await self.clients.get(event.resultingClientId);
+      }
+      if (client) {
+        const baseTarget = extractTargetFromClientUrl(client.url);
+        if (baseTarget) {
+          targetHref = new URL(reqUrl.pathname + reqUrl.search, baseTarget.origin).href;
+        }
+      }
+      if (!targetHref && req.referrer) {
+        const refTarget = extractTargetFromClientUrl(req.referrer);
+        if (refTarget) {
+          targetHref = new URL(reqUrl.pathname + reqUrl.search, refTarget.origin).href;
+        }
+      }
+    }
+
+    if (!targetHref) {
+      return fetch(req);
+    }
+
+    const proxiedUrl = self.location.origin + PREFIX + targetHref;
+    const headers = new Headers(req.headers);
+
+    const init = {
+      method: req.method,
+      headers,
+      credentials: 'include',
+      redirect: 'follow',
+    };
+
+    if (req.method !== 'GET' && req.method !== 'HEAD') {
+      try {
+        const buf = await req.arrayBuffer();
+        if (buf.byteLength > 0) init.body = buf;
+      } catch (e) {}
+    }
+
+    return fetch(proxiedUrl, init);
+  })());
+});
+`;
+
+/**
  * Static, browser-cacheable client runtime served at /__proxy_runtime.js.
- * Zero per-request templating: derives proxy origin & target URL from window.location.
+ * Works alongside /__proxy_sw.js (and as a fallback inside iframes where SW is restricted).
  */
 export const CLIENT_RUNTIME_SCRIPT = `(function(){
 if(window.__PROXY_RT__)return;window.__PROXY_RT__=1;
-var P=location.origin,W=P.replace(/^http/i,'ws'),SKIP=/^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
-function curTarget(){try{var p=location.pathname.substring(1)+location.search+location.hash;p=p.replace(/^(https?|wss?):\\/(?!\\/)/i,'$1://');if(/^https?:\\/\\//i.test(p))return p;}catch(e){}return location.href;}
+var PRE='${PREFIX}',P=location.origin,W=P.replace(/^http/i,'ws'),SKIP=/^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
+try{if('serviceWorker' in navigator&&!navigator.serviceWorker.controller){navigator.serviceWorker.register('${SW_PATH}',{scope:'/'}).catch(function(){});}}catch(e){}
+function curTarget(){
+  try{
+    var pn=location.pathname;
+    var p=(pn.indexOf(PRE)===0?pn.substring(PRE.length):pn.substring(1))+location.search+location.hash;
+    p=p.replace(/^(https?|wss?):\\/(?!\\/)/i,'$1://');
+    if(/^https?:\\/\\//i.test(p))return p;
+  }catch(e){}
+  return location.href;
+}
 function rwHttp(u){
   if(typeof u!=='string'){if(u&&typeof u.href==='string')u=u.href;else return u;}
   var t=u.trim();if(!t||SKIP.test(t))return u;
-  if(t.indexOf(P+'/http')===0||t.indexOf(P+'/ws')===0||t.indexOf('/__proxy_')===0||t.indexOf(P+'/__proxy_')===0)return u;
-  if(/^\\/(https?|wss?):\\/\\//i.test(t))return P+t;
+  if(t.indexOf(P+PRE)===0||t.indexOf(PRE)===0||t.indexOf(P+'/http')===0||t.indexOf(P+'/ws')===0||t.indexOf('/__proxy_')===0||t.indexOf(P+'/__proxy_')===0)return u;
+  if(/^\\/(https?|wss?):\\/\\//i.test(t))return P+PRE+t.substring(1);
   try{
     var r=new URL(t,curTarget());
     if(r.origin===P){
-      var sub=r.pathname.substring(1).replace(/^(https?|wss?):\\/(?!\\/)/i,'$1://');
-      if(/^(https?|wss?):\\/\\//i.test(sub))return P+'/'+sub+r.search+r.hash;
+      var pn=r.pathname;
+      var sub=(pn.indexOf(PRE)===0?pn.substring(PRE.length):pn.substring(1)).replace(/^(https?|wss?):\\/(?!\\/)/i,'$1://');
+      if(/^(https?|wss?):\\/\\//i.test(sub))return P+PRE+sub+r.search+r.hash;
       r=new URL(r.pathname+r.search+r.hash,new URL(curTarget()).origin);
     }
-    if(r.protocol==='http:'||r.protocol==='https:')return P+'/'+r.href;
-    if(r.protocol==='ws:'||r.protocol==='wss:')return W+'/'+r.href;
+    if(r.protocol==='http:'||r.protocol==='https:')return P+PRE+r.href;
+    if(r.protocol==='ws:'||r.protocol==='wss:')return W+PRE+r.href;
   }catch(e){}
   return u;
 }
 function rwWs(u){
   if(typeof u!=='string'){if(u&&typeof u.href==='string')u=u.href;else return u;}
-  var t=u.trim();if(!t||t.indexOf(W+'/ws')===0)return u;
+  var t=u.trim();if(!t||t.indexOf(W+PRE)===0||t.indexOf(W+'/ws')===0)return u;
   try{
     var tb=new URL(curTarget()),r=new URL(t,tb.href.replace(/^http/i,'ws'));
     if(r.origin===W){
-      var sub=r.pathname.substring(1).replace(/^(wss?):\\/(?!\\/)/i,'$1://');
-      if(/^wss?:\\/\\//i.test(sub))return W+'/'+sub+r.search;
+      var pn=r.pathname;
+      var sub=(pn.indexOf(PRE)===0?pn.substring(PRE.length):pn.substring(1)).replace(/^(wss?):\\/(?!\\/)/i,'$1://');
+      if(/^wss?:\\/\\//i.test(sub))return W+PRE+sub+r.search;
       r=new URL(r.pathname+r.search,tb.origin.replace(/^http/i,'ws'));
     }
-    var o=W+'/'+r.href;return o+(o.indexOf('?')===-1?'?':'&')+'__proxy_origin='+encodeURIComponent(tb.origin);
+    var o=W+PRE+r.href;return o+(o.indexOf('?')===-1?'?':'&')+'__proxy_origin='+encodeURIComponent(tb.origin);
   }catch(e){}
   return u;
 }
@@ -300,7 +439,7 @@ var oReq=window.Request;
 if(oReq){var PReq=function(i,o){if(typeof i==='string'||i instanceof URL){i=rwHttp(String(i));}return arguments.length>1?new oReq(i,o):new oReq(i);};PReq.prototype=oReq.prototype;window.Request=PReq;}
 var oF=window.fetch;
 if(oF){window.fetch=function(a,b){try{if(typeof a==='string'||a instanceof URL){a=rwHttp(String(a));}else if(a instanceof oReq){var n2=rwHttp(a.url);if(n2!==a.url)a=new oReq(n2,a);}}catch(e){}return oF.call(this,a,b);};}
-try{if(navigator&&navigator.serviceWorker&&navigator.serviceWorker.register){navigator.serviceWorker.register=function(){return Promise.reject(new DOMException('ServiceWorker disabled in proxy','SecurityError'));};}}catch(e){}
+try{if(navigator&&navigator.serviceWorker&&navigator.serviceWorker.register){var oSwReg=navigator.serviceWorker.register.bind(navigator.serviceWorker);navigator.serviceWorker.register=function(url,opts){if(String(url).indexOf('${SW_PATH}')!==-1)return oSwReg(url,opts);return Promise.reject(new DOMException('Upstream ServiceWorker disabled in proxy','SecurityError'));};}}catch(e){}
 var oXO=XMLHttpRequest.prototype.open;
 XMLHttpRequest.prototype.open=function(m,u){var a=Array.prototype.slice.call(arguments);if(typeof u==='string'||u instanceof URL){a[1]=rwHttp(String(u));}return oXO.apply(this,a);};
 var oWS=window.WebSocket;

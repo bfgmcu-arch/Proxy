@@ -493,7 +493,7 @@ test('Discord Gateway WebSocket, Remote Auth QR WebSocket, Redirects, and Cookie
   globalThis.fetch = async (input, init) => {
     const urlStr = typeof input === 'string' ? input : input.url;
     const headers = new Headers(init?.headers || {});
-    calls.push({ url: urlStr, headers });
+    calls.push({ url: urlStr, headers, cf: init?.cf });
 
     if (urlStr.startsWith('https://gateway.discord.gg/') || urlStr.startsWith('https://remote-auth-gateway.discord.gg/')) {
       return new Response('ws-mock-ok', { status: 200 });
@@ -552,7 +552,7 @@ test('Discord Gateway WebSocket, Remote Auth QR WebSocket, Redirects, and Cookie
       'https://my.workers.dev/-----https://discord.com/invite/testinvite'
     );
 
-    // 4. Cookie-free Discord CDN strips Cookie and sets Cache-Control
+    // 4. Cookie-free Discord CDN strips Cookie, sets Cache-Control, and omits fetchInit.cf
     const cdnResp = await worker.fetch(
       new Request('https://my.workers.dev/-----https://cdn.discordapp.com/avatars/123/abc.png', {
         headers: { Cookie: '__dcfduid=secret' },
@@ -562,6 +562,7 @@ test('Discord Gateway WebSocket, Remote Auth QR WebSocket, Redirects, and Cookie
     );
     assert.equal(cdnResp.status, 200);
     assert.equal(calls[3].headers.get('cookie'), null);
+    assert.equal(calls[3].cf, undefined);
     assert.match(cdnResp.headers.get('cache-control'), /max-age=86400/);
   } finally {
     globalThis.fetch = origFetch;

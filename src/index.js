@@ -865,9 +865,6 @@ export default {
     if (hasBody) {
       fetchInit.duplex = 'half';
     }
-    if (isCacheableStatic) {
-      fetchInit.cf = { cacheTtl: 86400, cacheEverything: true };
-    }
 
     let response;
     try {

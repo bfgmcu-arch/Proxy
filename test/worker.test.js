@@ -2,13 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import worker, {
-  PREFIX,
-  RUNTIME_PATH,
-  SW_PATH,
-  HEALTH_PATH,
-  DISCORD_ORIGIN,
-  SERVICE_WORKER_SCRIPT,
-  CLIENT_RUNTIME_SCRIPT,
+  getProxyConfig,
   isDiscordHost,
   isDiscordAppPath,
   isStreamingMediaUrl,
@@ -24,6 +18,16 @@ import worker, {
   computeUpstreamOrigin,
   stripInternalParams,
 } from '../src/index.js';
+
+const {
+  PREFIX,
+  RUNTIME_PATH,
+  SW_PATH,
+  HEALTH_PATH,
+  DISCORD_ORIGIN,
+  SERVICE_WORKER_SCRIPT,
+  CLIENT_RUNTIME_SCRIPT,
+} = getProxyConfig();
 
 // ============================================================================
 // 1. Unit Tests: Discord Domains, Paths, CDNs, URL/CSS/Cookie Rewriting

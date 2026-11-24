@@ -5,12 +5,12 @@
  * Cloudflare Git Builds, AND Cloudflare Dashboard Quick Edit copy-paste.
  */
 
-export const PREFIX = '/-----';
-export const RUNTIME_PATH = '/__proxy_runtime.js';
-export const SW_PATH = '/__proxy_sw.js';
-export const HEALTH_PATH = '/__proxy_health';
+const PREFIX = '/-----';
+const RUNTIME_PATH = '/__proxy_runtime.js';
+const SW_PATH = '/__proxy_sw.js';
+const HEALTH_PATH = '/__proxy_health';
 
-export const DISCORD_ORIGIN = 'https://discord.com';
+const DISCORD_ORIGIN = 'https://discord.com';
 
 const MAX_CSS_REWRITE_BYTES = 1_500_000;
 const STATIC_CACHE_CONTROL = 'public, max-age=86400, stale-while-revalidate=604800';
@@ -36,7 +36,7 @@ const DISCORD_EXACT_HOSTS = new Set([
 ]);
 
 const DISCORD_APP_PATH_RE =
-  /^\/(?:login|register|app|channels(?:\/|$)|invite(?:\/|$)|oauth2(?:\/|$)|api(?:\/|$)|assets(?:\/|$)|verify(?:\/|$)|reset(?:\/|$)|handoff(?:\/|$)|activate(?:\/|$)|billing(?:\/|$)|store(?:\/|$)|nitro(?:\/|$)|shop(?:\/|$)|quests(?:\/|$)|discovery(?:\/|$)|servers(?:\/|$)|developers(?:\/|$)|me(?:\/|$)|guild-stages(?:\/|$)|events(?:\/|$)|cdn-cgi(?:\/|$))/i;
+  /^\/(?:login|register|app|channels(?:\/|$)|invite(?:\/|$)|oauth2(?:\/|$)|api(?:\/|$)|assets(?:\/|$)|verify(?:\/|$)|reset(?:\/|$)|handoff(?:\/|$)|activate(?:\/|$)|billing(?:\/|$)|store(?:\/|$)|nitro(?:\/|$)|shop(?:\/|$)|quests(?:\/|$)|discovery(?:\/|$)|servers(?:\/|$)|developers(?:\/|$)|me(?:\/|$)|guild-stages(?:\/|$)|events(?:\/|$)|cdn-cgi(?:\/|$)|favicon\.ico$|robots\.txt$)/i;
 
 const DISCORD_CORS_ALLOW_HEADERS =
   'Authorization, Content-Type, X-Super-Properties, X-Discord-Locale, X-Discord-Timezone, X-Debug-Options, X-Context-Properties, X-Fingerprint, X-Captcha-Key, X-Captcha-Rqtoken, X-Captcha-Session-Id, X-Audit-Log-Reason, If-None-Match';
@@ -305,7 +305,7 @@ function corsHeaders(request) {
 // Service Worker & Client Runtime Scripts (Discord-Aware Proxy)
 // ============================================================================
 
-export const SERVICE_WORKER_SCRIPT = `const PREFIX = '${PREFIX}';
+const SERVICE_WORKER_SCRIPT = `const PREFIX = '${PREFIX}';
 const DISCORD_ORIGIN = '${DISCORD_ORIGIN}';
 const DISCORD_PATH_RE = ${DISCORD_APP_PATH_RE.toString()};
 
@@ -395,7 +395,7 @@ self.addEventListener('fetch', (event) => {
 });
 `;
 
-export const CLIENT_RUNTIME_SCRIPT = `(function(){
+const CLIENT_RUNTIME_SCRIPT = `(function(){
 if(window.__PROXY_RT__)return;window.__PROXY_RT__=1;
 var PRE='${PREFIX}',P=location.origin,W=P.replace(/^http/i,'ws'),D_ORIGIN='${DISCORD_ORIGIN}',SKIP=/^(data:|blob:|javascript:|mailto:|tel:|about:|#)/i;
 try{if('serviceWorker' in navigator&&!navigator.serviceWorker.controller){navigator.serviceWorker.register('${SW_PATH}',{scope:'/'}).catch(function(){});}}catch(e){}
@@ -473,6 +473,18 @@ hP(HTMLScriptElement.prototype,'src',0);hP(HTMLImageElement.prototype,'src',0);h
 function igP(pr,k){if(!pr)return;var d=Object.getOwnPropertyDescriptor(pr,k);if(!d||!d.configurable)return;Object.defineProperty(pr,k,{configurable:true,enumerable:d.enumerable,get:function(){return'';},set:function(){}});}
 igP(HTMLScriptElement.prototype,'integrity');igP(HTMLLinkElement.prototype,'integrity');
 })();`;
+
+export function getProxyConfig() {
+  return {
+    PREFIX,
+    RUNTIME_PATH,
+    SW_PATH,
+    HEALTH_PATH,
+    DISCORD_ORIGIN,
+    SERVICE_WORKER_SCRIPT,
+    CLIENT_RUNTIME_SCRIPT,
+  };
+}
 
 // ============================================================================
 // Streaming Cloudflare HTMLRewriter

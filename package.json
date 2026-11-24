@@ -1,7 +1,7 @@
 {
-  "name": "cloudflare-web-proxy",
+  "name": "cloudflare-discord-proxy",
   "version": "2.0.0",
-  "description": "Self-contained Cloudflare Workers web proxy with built-in YouTube InnerTube player",
+  "description": "Self-contained Cloudflare Workers Discord proxy with full sign-in, Gateway WebSocket, and CDN support",
   "main": "src/index.js",
   "type": "module",
   "scripts": {

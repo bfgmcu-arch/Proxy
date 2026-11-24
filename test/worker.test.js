@@ -1,193 +1,234 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import vm from 'node:vm';
 import worker, {
   PREFIX,
   RUNTIME_PATH,
   SW_PATH,
-  extractVideoId,
-  parseStartSeconds,
-  parseIsoDuration,
-  matchYouTubePageRoute,
-  parseSearchVideos,
-  extractPlayableStreams,
-  rewriteM3u8,
+  HEALTH_PATH,
+  DISCORD_ORIGIN,
+  SERVICE_WORKER_SCRIPT,
+  CLIENT_RUNTIME_SCRIPT,
+  isDiscordHost,
+  isDiscordAppPath,
+  isStreamingMediaUrl,
+  isCookieFreeCdn,
+  isStaticAssetUrl,
+  normalizeTargetUrl,
+  extractProxiedTarget,
+  resolveIncomingTargetUrl,
+  rewriteUrl,
+  rewriteSrcset,
   rewriteCss,
   rewriteSetCookie,
-  resolveIncomingTargetUrl,
-  isStreamingMediaUrl,
-  isStaticAssetUrl,
-  isCookieFreeCdn,
+  computeUpstreamOrigin,
+  stripInternalParams,
 } from '../src/index.js';
 
-test('extractVideoId parses watch, youtu.be, shorts, embed, and raw IDs', () => {
-  assert.equal(extractVideoId('dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
-  assert.equal(extractVideoId('https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=10'), 'dQw4w9WgXcQ');
-  assert.equal(extractVideoId('https://youtu.be/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
-  assert.equal(extractVideoId('https://www.youtube.com/shorts/dQw4w9WgXcQ'), 'dQw4w9WgXcQ');
-  assert.equal(extractVideoId('not a video'), null);
+// ============================================================================
+// 1. Unit Tests: Discord Domains, Paths, CDNs, URL/CSS/Cookie Rewriting
+// ============================================================================
+
+test('isDiscordHost recognizes all Discord domains and rejects lookalikes', () => {
+  const valid = [
+    'discord.com',
+    'ptb.discord.com',
+    'canary.discord.com',
+    'gateway.discord.gg',
+    'remote-auth-gateway.discord.gg',
+    'discord.gg',
+    'cdn.discordapp.com',
+    'media.discordapp.net',
+    'images-ext-1.discordapp.net',
+    'images-ext-2.discordapp.net',
+    'us-east1.discord.media',
+    'discordstatus.com',
+    'dis.gd',
+  ];
+  for (const h of valid) {
+    assert.equal(isDiscordHost(h), true, `Expected ${h} to be a Discord host`);
+  }
+
+  const invalid = [
+    '',
+    null,
+    'example.com',
+    'evil-discord.com',
+    'discord.com.evil.com',
+    'notdiscord.gg',
+  ];
+  for (const h of invalid) {
+    assert.equal(isDiscordHost(h), false, `Expected ${h} NOT to be a Discord host`);
+  }
 });
 
-test('parseStartSeconds and matchYouTubePageRoute seamlessly map all YouTube URLs', async () => {
-  assert.equal(parseStartSeconds('90'), 90);
-  assert.equal(parseStartSeconds('1m30s'), 90);
-  assert.equal(parseStartSeconds('1h2m3s'), 3723);
+test('isDiscordAppPath matches Discord app & auth routes and rejects proxy internals', () => {
+  const valid = [
+    '/login',
+    '/register',
+    '/app',
+    '/channels/@me',
+    '/channels/123456789/987654321',
+    '/invite/my-server',
+    '/oauth2/authorize',
+    '/api/v9/auth/login',
+    '/api/v9/auth/mfa/totp',
+    '/api/v9/users/@me',
+    '/assets/1234abcd.js',
+    '/verify',
+    '/reset',
+    '/handoff',
+  ];
+  for (const p of valid) {
+    assert.equal(isDiscordAppPath(p), true, `Expected ${p} to be a Discord app path`);
+  }
 
-  assert.deepEqual(
-    matchYouTubePageRoute(new URL('https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=1m30s')),
-    { type: 'watch', videoId: 'dQw4w9WgXcQ', startSeconds: 90 }
-  );
-  assert.deepEqual(
-    matchYouTubePageRoute(new URL('https://youtu.be/dQw4w9WgXcQ?t=42')),
-    { type: 'watch', videoId: 'dQw4w9WgXcQ', startSeconds: 42 }
-  );
-  assert.deepEqual(
-    matchYouTubePageRoute(new URL('https://www.youtube.com/embed/dQw4w9WgXcQ')),
-    { type: 'embed', videoId: 'dQw4w9WgXcQ', startSeconds: 0 }
-  );
-  assert.deepEqual(
-    matchYouTubePageRoute(new URL('https://www.youtube.com/results?search_query=chess')),
-    { type: 'search', query: 'chess' }
-  );
-  assert.deepEqual(
-    matchYouTubePageRoute(new URL('https://www.youtube.com/')),
-    { type: 'home' }
-  );
-  // API endpoints and ?raw=1 must NOT be intercepted
-  assert.equal(matchYouTubePageRoute(new URL('https://www.youtube.com/youtubei/v1/player')), null);
-  assert.equal(matchYouTubePageRoute(new URL('https://www.youtube.com/watch?v=dQw4w9WgXcQ&raw=1')), null);
-
-  // Worker seamlessly serves watch & embed for proxied YouTube URLs
-  const wResp = await worker.fetch(
-    new Request('https://my.workers.dev/-----https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=30'),
-    {},
-    {}
-  );
-  assert.equal(wResp.status, 200);
-  const wHtml = await wResp.text();
-  assert.match(wHtml, /dQw4w9WgXcQ/);
-  assert.match(wHtml, /initStart = 30/);
-
-  const embResp = await worker.fetch(
-    new Request('https://my.workers.dev/-----https://www.youtube.com/embed/dQw4w9WgXcQ'),
-    {},
-    {}
-  );
-  assert.equal(embResp.status, 200);
-  assert.match(await embResp.text(), /YouTube Embed/);
-
-  // Shorts routing: both /shorts/ID and proxied youtube.com/shorts/ID open vertical Shorts UI
-  assert.deepEqual(
-    matchYouTubePageRoute(new URL('https://www.youtube.com/shorts/IR3ZWc0XDzE')),
-    { type: 'shorts', videoId: 'IR3ZWc0XDzE' }
-  );
-  assert.deepEqual(
-    matchYouTubePageRoute(new URL('https://www.youtube.com/shorts')),
-    { type: 'shorts', videoId: '' }
-  );
-  const shResp = await worker.fetch(
-    new Request('https://my.workers.dev/-----https://www.youtube.com/shorts/IR3ZWc0XDzE'),
-    {},
-    {}
-  );
-  assert.equal(shResp.status, 200);
-  const shHtml = await shResp.text();
-  assert.match(shHtml, /YouTube Shorts/);
-  assert.match(shHtml, /IR3ZWc0XDzE/);
+  const invalid = ['/', '/__proxy_health', '/__proxy_sw.js', '/-----https://discord.com/login', '/random'];
+  for (const p of invalid) {
+    assert.equal(isDiscordAppPath(p), false, `Expected ${p} NOT to be a Discord app path`);
+  }
 });
 
-test('parseSearchVideos extracts videoRenderer items from InnerTube JSON', () => {
-  const sample = {
-    contents: {
-      sectionListRenderer: {
-        contents: [
-          {
-            itemSectionRenderer: {
-              contents: [
-                {
-                  videoRenderer: {
-                    videoId: 'dQw4w9WgXcQ',
-                    title: { runs: [{ text: 'Rick Astley - Never Gonna Give You Up' }] },
-                    ownerText: { runs: [{ text: 'Rick Astley' }] },
-                    shortViewCountText: { simpleText: '1.5B views' },
-                    lengthText: { simpleText: '3:33' },
-                  },
-                },
-              ],
-            },
-          },
-        ],
-      },
-    },
-  };
-  const videos = parseSearchVideos(sample);
-  assert.equal(videos.length, 1);
-  assert.equal(videos[0].id, 'dQw4w9WgXcQ');
-  assert.equal(videos[0].title, 'Rick Astley - Never Gonna Give You Up');
-  assert.equal(videos[0].author, 'Rick Astley');
-  assert.equal(videos[0].length, '3:33');
+test('CDN, static asset, and streaming classification helpers', () => {
+  assert.equal(isCookieFreeCdn('cdn.discordapp.com'), true);
+  assert.equal(isCookieFreeCdn('media.discordapp.net'), true);
+  assert.equal(isCookieFreeCdn('images-ext-1.discordapp.net'), true);
+  assert.equal(isCookieFreeCdn('discord.com'), false);
+
+  assert.equal(isStaticAssetUrl(new URL('https://cdn.discordapp.com/avatars/1/abc.png')), true);
+  assert.equal(isStaticAssetUrl(new URL('https://discord.com/assets/main.js')), true);
+  assert.equal(isStaticAssetUrl(new URL('https://discord.com/api/v9/auth/login')), false);
+  assert.equal(isStreamingMediaUrl(new URL('https://media.discordapp.net/stream/video.m3u8')), true);
 });
 
-test('extractPlayableStreams rewrites muxed MP4, audio, and HLS URLs through Worker', () => {
-  const playerJson = {
-    playabilityStatus: { status: 'OK' },
-    videoDetails: { videoId: 'dQw4w9WgXcQ', title: 'Test Video', author: 'Test Channel', viewCount: '100' },
-    streamingData: {
-      hlsManifestUrl: 'https://manifest.googlevideo.com/api/manifest/hls_variant/abc.m3u8',
-      formats: [
-        { itag: 18, qualityLabel: '360p', mimeType: 'video/mp4', url: 'https://rr1---sn-a.googlevideo.com/videoplayback?itag=18' },
-      ],
-      adaptiveFormats: [
-        { itag: 251, bitrate: 128000, mimeType: 'audio/webm', url: 'https://rr1---sn-a.googlevideo.com/videoplayback?itag=251' },
-      ],
-    },
-  };
-  const out = extractPlayableStreams(playerJson, 'https://my.workers.dev');
-  assert.equal(out.status, 'OK');
-  assert.equal(out.muxed[0].url, 'https://my.workers.dev/-----https://rr1---sn-a.googlevideo.com/videoplayback?itag=18');
-  assert.equal(out.audio[0].url, 'https://my.workers.dev/-----https://rr1---sn-a.googlevideo.com/videoplayback?itag=251');
-  assert.equal(out.hlsUrl, 'https://my.workers.dev/-----https://manifest.googlevideo.com/api/manifest/hls_variant/abc.m3u8');
-});
+test('resolveIncomingTargetUrl handles prefixed, query, referer-relative, and direct Discord paths', () => {
+  const r1 = resolveIncomingTargetUrl(new URL('https://my.workers.dev/-----https://discord.com/login'), null);
+  assert.equal(r1.targetUrl.href, 'https://discord.com/login');
 
-test('rewriteM3u8 rewrites segment URLs and URI attributes', () => {
-  const m3u8 = [
-    '#EXTM3U',
-    '#EXT-X-MEDIA:TYPE=AUDIO,URI="https://manifest.googlevideo.com/audio.m3u8"',
-    '#EXTINF:5.0,',
-    'https://rr1---sn-a.googlevideo.com/videoplayback?seg=1',
-  ].join('\n');
+  const r2 = resolveIncomingTargetUrl(new URL('https://my.workers.dev/?url=https://discord.com/app'), null);
+  assert.equal(r2.targetUrl.href, 'https://discord.com/app');
 
-  const out = rewriteM3u8(m3u8, 'https://manifest.googlevideo.com/master.m3u8', 'https://my.workers.dev');
-  assert.match(out, /URI="https:\/\/my\.workers\.dev\/-----https:\/\/manifest\.googlevideo\.com\/audio\.m3u8"/);
-  assert.match(out, /https:\/\/my\.workers\.dev\/-----https:\/\/rr1---sn-a\.googlevideo\.com\/videoplayback\?seg=1/);
-});
-
-test('URL, cookie, CSS, and static/media classification helpers work correctly', () => {
-  assert.equal(isStreamingMediaUrl(new URL('https://rr1---sn-abc.googlevideo.com/videoplayback?itag=18')), true);
-  assert.equal(isStaticAssetUrl(new URL('https://rr1---sn-abc.googlevideo.com/videoplayback?itag=18')), false);
-  assert.equal(isStaticAssetUrl(new URL('https://i.ytimg.com/vi/abc/hqdefault.jpg')), true);
-  assert.equal(isCookieFreeCdn('i.ytimg.com'), true);
-
-  const res = resolveIncomingTargetUrl(
-    new URL('https://my.workers.dev/callback/user'),
-    `https://my.workers.dev${PREFIX}https://www.chess.com/play`
+  const r3 = resolveIncomingTargetUrl(
+    new URL('https://my.workers.dev/api/v9/auth/login'),
+    'https://my.workers.dev/-----https://ptb.discord.com/login'
   );
-  assert.equal(res.targetUrl.href, 'https://www.chess.com/callback/user');
+  assert.equal(r3.targetUrl.href, 'https://ptb.discord.com/api/v9/auth/login');
 
-  const cookie = rewriteSetCookie('SID=1; Domain=.youtube.com; Path=/; SameSite=Lax', true);
-  assert.doesNotMatch(cookie, /Domain=/i);
-  assert.match(cookie, /SameSite=None/);
-  assert.match(cookie, /\bSecure\b/);
+  const r4 = resolveIncomingTargetUrl(new URL('https://my.workers.dev/login'), null);
+  assert.equal(r4.targetUrl.href, 'https://discord.com/login');
 
-  const css = rewriteCss('.a { background: url("/img/x.png"); }', 'https://www.chess.com/s.css', 'https://my.workers.dev');
-  assert.match(css, /https:\/\/my\.workers\.dev\/-----https:\/\/www\.chess\.com\/img\/x\.png/);
+  const r5 = resolveIncomingTargetUrl(new URL('https://my.workers.dev/channels/@me'), null);
+  assert.equal(r5.targetUrl.href, 'https://discord.com/channels/@me');
+
+  const r6 = resolveIncomingTargetUrl(new URL('https://my.workers.dev/unknown-path'), null);
+  assert.equal(r6.status, 400);
 });
 
-test('Cloudflare Worker endpoints: /yt, /yt/api/player, /__proxy_sw.js, googlevideo Range/206, and M3U8 proxy', async () => {
-  // 1. Health & Service Worker & Runtime
-  const health = await worker.fetch(new Request('https://my.workers.dev/__proxy_health'), {}, {});
+test('rewriteUrl, rewriteSrcset, rewriteCss, and normalizeTargetUrl handle Discord URLs', () => {
+  const base = 'https://discord.com/login';
+  const proxy = 'https://my.workers.dev';
+
+  assert.equal(
+    rewriteUrl('//discord.com/assets/app.js', base, proxy),
+    'https://my.workers.dev/-----https://discord.com/assets/app.js'
+  );
+  assert.equal(
+    rewriteUrl('/api/v9/auth/login', base, proxy),
+    'https://my.workers.dev/-----https://discord.com/api/v9/auth/login'
+  );
+  assert.equal(
+    rewriteUrl('wss://gateway.discord.gg/?v=9', base, proxy),
+    'wss://my.workers.dev/-----wss://gateway.discord.gg/?v=9'
+  );
+  assert.equal(rewriteUrl('data:image/png;base64,AAA', base, proxy), 'data:image/png;base64,AAA');
+  assert.equal(
+    rewriteUrl('https://my.workers.dev/-----https://discord.com/app', base, proxy),
+    'https://my.workers.dev/-----https://discord.com/app'
+  );
+
+  const srcset = rewriteSrcset(
+    'https://cdn.discordapp.com/a.png 1x, https://cdn.discordapp.com/b.png 2x',
+    base,
+    proxy
+  );
+  assert.equal(
+    srcset,
+    'https://my.workers.dev/-----https://cdn.discordapp.com/a.png 1x, https://my.workers.dev/-----https://cdn.discordapp.com/b.png 2x'
+  );
+
+  const css = rewriteCss(
+    '@import "/assets/theme.css"; .icon { background: url("https://cdn.discordapp.com/e.webp"); }',
+    base,
+    proxy
+  );
+  assert.match(css, /https:\/\/my\.workers\.dev\/-----https:\/\/discord\.com\/assets\/theme\.css/);
+  assert.match(css, /https:\/\/my\.workers\.dev\/-----https:\/\/cdn\.discordapp\.com\/e\.webp/);
+
+  assert.equal(normalizeTargetUrl('https:/discord.com/login'), 'https://discord.com/login');
+  assert.equal(normalizeTargetUrl('wss:/gateway.discord.gg/'), 'wss://gateway.discord.gg/');
+});
+
+test('rewriteSetCookie strips Domain, normalizes Path, and adapts SameSite/Secure for HTTPS and HTTP', () => {
+  const httpsCookie = rewriteSetCookie(
+    '__sdcfduid=abc123; Domain=.discord.com; Path=/api; HttpOnly; SameSite=Lax; Secure',
+    true
+  );
+  assert.doesNotMatch(httpsCookie, /Domain=/i);
+  assert.match(httpsCookie, /^__sdcfduid=abc123;/);
+  assert.match(httpsCookie, /\bPath=\//);
+  assert.match(httpsCookie, /\bHttpOnly\b/);
+  assert.match(httpsCookie, /\bSameSite=None\b/);
+  assert.match(httpsCookie, /\bSecure\b/);
+
+  const httpCookie = rewriteSetCookie(
+    '__dcfduid=xyz789; Domain=.discord.com; Path=/; HttpOnly; Secure; SameSite=None; Partitioned',
+    false
+  );
+  assert.doesNotMatch(httpCookie, /Domain=/i);
+  assert.doesNotMatch(httpCookie, /\bSecure\b/i);
+  assert.doesNotMatch(httpCookie, /\bPartitioned\b/i);
+  assert.match(httpCookie, /\bSameSite=Lax\b/);
+});
+
+test('computeUpstreamOrigin and stripInternalParams enforce Discord origins', () => {
+  const { cleanedUrl, explicitOrigin } = stripInternalParams(
+    new URL('https://gateway.discord.gg/?v=9&__proxy_origin=https%3A%2F%2Fptb.discord.com')
+  );
+  assert.equal(cleanedUrl.href, 'https://gateway.discord.gg/?v=9');
+  assert.equal(explicitOrigin, 'https://ptb.discord.com');
+
+  assert.equal(
+    computeUpstreamOrigin(cleanedUrl, null, explicitOrigin),
+    'https://ptb.discord.com'
+  );
+  assert.equal(
+    computeUpstreamOrigin(new URL('https://gateway.discord.gg/?v=9'), null, null),
+    DISCORD_ORIGIN
+  );
+  assert.equal(
+    computeUpstreamOrigin(new URL('https://canary.discord.com/login'), null, null),
+    'https://canary.discord.com'
+  );
+});
+
+// ============================================================================
+// 2. Worker Infrastructure, Launcher, Health, SW, CORS, IP Allowlist
+// ============================================================================
+
+test('Worker serves Discord launcher, health check, SW, runtime, and bootstrap page', async () => {
+  const root = await worker.fetch(new Request('https://my.workers.dev/'), {}, {});
+  assert.equal(root.status, 200);
+  const rootHtml = await root.text();
+  assert.match(rootHtml, /Discord Proxy/);
+  assert.match(rootHtml, /Sign In to Discord/);
+  assert.match(rootHtml, /discord\.com\/login/);
+
+  const health = await worker.fetch(new Request(`https://my.workers.dev${HEALTH_PATH}`), {}, {});
   assert.equal(health.status, 200);
   const hJson = await health.json();
-  assert.equal(hJson.youtube, true);
+  assert.equal(hJson.ok, true);
+  assert.equal(hJson.discord, true);
+  assert.equal(hJson.websockets, true);
   assert.equal(hJson.serviceWorker, true);
 
   const sw = await worker.fetch(new Request(`https://my.workers.dev${SW_PATH}`), {}, {});
@@ -198,138 +239,440 @@ test('Cloudflare Worker endpoints: /yt, /yt/api/player, /__proxy_sw.js, googlevi
   assert.equal(rt.status, 200);
   assert.match(rt.headers.get('cache-control'), /immutable/);
 
-  // 2. /yt UI and /yt/watch UI
-  const ytPage = await worker.fetch(new Request('https://my.workers.dev/yt'), {}, {});
-  assert.equal(ytPage.status, 200);
-  assert.match(await ytPage.text(), /YouTube — Cloudflare Proxy/);
+  const go = await worker.fetch(
+    new Request('https://my.workers.dev/__proxy_go?url=discord.com/login'),
+    {},
+    {}
+  );
+  assert.equal(go.status, 200);
+  assert.match(await go.text(), /https:\/\/discord\.com\/login/);
+});
 
-  // 3. Mock upstream fetch for /yt/api/player, googlevideo 206 Range, and .m3u8 manifest
+test('Worker enforces ALLOWED_IPS and handles CORS preflight with Discord headers', async () => {
+  const blocked = await worker.fetch(
+    new Request('https://my.workers.dev/', { headers: { 'cf-connecting-ip': '1.2.3.4' } }),
+    { ALLOWED_IPS: '5.6.7.8' },
+    {}
+  );
+  assert.equal(blocked.status, 403);
+
+  const allowed = await worker.fetch(
+    new Request('https://my.workers.dev/', { headers: { 'cf-connecting-ip': '5.6.7.8' } }),
+    { ALLOWED_IPS: '5.6.7.8' },
+    {}
+  );
+  assert.equal(allowed.status, 200);
+
+  const preflight = await worker.fetch(
+    new Request('https://my.workers.dev/-----https://discord.com/api/v9/auth/login', {
+      method: 'OPTIONS',
+      headers: {
+        Origin: 'https://my.workers.dev',
+        'Access-Control-Request-Method': 'POST',
+      },
+    }),
+    {},
+    {}
+  );
+  assert.equal(preflight.status, 204);
+  assert.equal(preflight.headers.get('access-control-allow-origin'), 'https://my.workers.dev');
+  assert.equal(preflight.headers.get('access-control-allow-credentials'), 'true');
+  assert.match(preflight.headers.get('access-control-allow-headers'), /Authorization/);
+  assert.match(preflight.headers.get('access-control-allow-headers'), /X-Super-Properties/);
+  assert.match(preflight.headers.get('access-control-allow-headers'), /X-Captcha-Key/);
+});
+
+// ============================================================================
+// 3. Rigorous End-to-End Discord Sign-In, MFA, Captcha, Gateway & CDN Tests
+// ============================================================================
+
+test('Discord Sign-In flow: /login page, cookies, POST /api/v9/auth/login, MFA TOTP, Captcha, and /users/@me', async () => {
   const origFetch = globalThis.fetch;
-  let lastInit = null;
-  globalThis.fetch = async (u, init) => {
-    lastInit = init;
-    if (String(u).includes('/youtubei/v1/player')) {
+  const capturedCalls = [];
+
+  globalThis.fetch = async (input, init) => {
+    const urlStr = typeof input === 'string' ? input : input.url;
+    let bodyText = null;
+    if (init && init.body) {
+      bodyText = await new Response(init.body).text();
+    }
+    capturedCalls.push({
+      url: urlStr,
+      method: init?.method || 'GET',
+      headers: new Headers(init?.headers || {}),
+      bodyText,
+    });
+
+    if (urlStr === 'https://discord.com/login') {
+      const headers = new Headers({
+        'Content-Type': 'text/html; charset=utf-8',
+        'X-Frame-Options': 'DENY',
+        'Content-Security-Policy': "default-src 'self'",
+        'Strict-Transport-Security': 'max-age=31536000',
+      });
+      headers.append('Set-Cookie', '__dcfduid=dcf123; Domain=.discord.com; Path=/; HttpOnly; Secure; SameSite=Lax');
+      headers.append('Set-Cookie', '__sdcfduid=sdcf456; Domain=.discord.com; Path=/; HttpOnly; Secure; SameSite=Lax');
+      return new Response('<html><head></head><body>Discord Login</body></html>', { status: 200, headers });
+    }
+
+    if (urlStr === 'https://discord.com/api/v9/auth/login') {
+      const payload = JSON.parse(bodyText || '{}');
+      if (payload.login === 'mfa@example.com') {
+        return new Response(
+          JSON.stringify({ user_id: '111', mfa: true, ticket: 'mfa-ticket-999', totp: true, sms: false }),
+          { status: 200, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      if (payload.login === 'captcha@example.com') {
+        return new Response(
+          JSON.stringify({ captcha_key: ['captcha-required'], captcha_sitekey: 'sitekey-abc', captcha_service: 'hcaptcha' }),
+          { status: 400, headers: { 'Content-Type': 'application/json' } }
+        );
+      }
+      const headers = new Headers({ 'Content-Type': 'application/json' });
+      headers.append('Set-Cookie', '__cf_bm=bm789; Domain=.discord.com; Path=/; HttpOnly; Secure; SameSite=None');
       return new Response(
-        JSON.stringify({
-          playabilityStatus: { status: 'OK' },
-          videoDetails: { videoId: 'dQw4w9WgXcQ', title: 'Mock Song', author: 'Mock Artist' },
-          streamingData: {
-            formats: [
-              { itag: 18, qualityLabel: '360p', mimeType: 'video/mp4', url: 'https://rr1---sn-a.googlevideo.com/videoplayback?itag=18' },
-            ],
-          },
-        }),
+        JSON.stringify({ user_id: '12345', token: 'discord-session-token-ok', user_settings: { locale: 'en-US' } }),
+        { status: 200, headers }
+      );
+    }
+
+    if (urlStr === 'https://discord.com/api/v9/auth/mfa/totp') {
+      const payload = JSON.parse(bodyText || '{}');
+      assert.equal(payload.ticket, 'mfa-ticket-999');
+      assert.equal(payload.code, '123456');
+      return new Response(
+        JSON.stringify({ token: 'discord-mfa-final-token', user_settings: { locale: 'en-US' } }),
         { status: 200, headers: { 'Content-Type': 'application/json' } }
       );
     }
-    if (String(u).includes('.m3u8')) {
-      return new Response('#EXTM3U\nhttps://rr1---sn-a.googlevideo.com/seg1.ts', {
-        status: 200,
-        headers: { 'Content-Type': 'application/vnd.apple.mpegurl' },
+
+    if (urlStr === 'https://discord.com/api/v9/users/@me') {
+      return new Response(
+        JSON.stringify({ id: '12345', username: 'testuser', discriminator: '0' }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+
+    return new Response('Not Found', { status: 404 });
+  };
+
+  try {
+    // Step 1: Load /login page and verify security headers stripped + Set-Cookie rewritten
+    const loginPageResp = await worker.fetch(
+      new Request('https://my.workers.dev/-----https://discord.com/login', {
+        headers: {
+          'cf-connecting-ip': '9.9.9.9',
+          'sec-fetch-site': 'same-origin',
+        },
+      }),
+      {},
+      {}
+    );
+    assert.equal(loginPageResp.status, 200);
+    assert.equal(loginPageResp.headers.get('x-frame-options'), null);
+    assert.equal(loginPageResp.headers.get('content-security-policy'), null);
+    assert.equal(loginPageResp.headers.get('strict-transport-security'), null);
+
+    const setCookies = loginPageResp.headers.getSetCookie();
+    assert.equal(setCookies.length, 2);
+    for (const c of setCookies) {
+      assert.doesNotMatch(c, /Domain=/i);
+      assert.match(c, /SameSite=None/);
+      assert.match(c, /\bSecure\b/);
+    }
+    // Verify CF and sec-fetch headers were stripped before hitting Discord
+    assert.equal(capturedCalls[0].headers.get('cf-connecting-ip'), null);
+    assert.equal(capturedCalls[0].headers.get('sec-fetch-site'), null);
+    assert.equal(capturedCalls[0].headers.get('host'), 'discord.com');
+
+    // Step 2: Direct password sign-in via POST /-----https://discord.com/api/v9/auth/login
+    const signInResp = await worker.fetch(
+      new Request('https://my.workers.dev/-----https://discord.com/api/v9/auth/login', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Origin: 'https://my.workers.dev',
+          Referer: 'https://my.workers.dev/-----https://discord.com/login',
+          Cookie: '__dcfduid=dcf123; __sdcfduid=sdcf456',
+          'X-Super-Properties': 'eyJvcyI6IldpbmRvd3MifQ==',
+        },
+        body: JSON.stringify({ login: 'user@example.com', password: 'secret', undelete: false }),
+      }),
+      {},
+      {}
+    );
+    assert.equal(signInResp.status, 200);
+    const signInJson = await signInResp.json();
+    assert.equal(signInJson.token, 'discord-session-token-ok');
+    assert.equal(signInResp.headers.get('access-control-allow-origin'), 'https://my.workers.dev');
+
+    const loginCall = capturedCalls[1];
+    assert.equal(loginCall.headers.get('origin'), 'https://discord.com');
+    assert.equal(loginCall.headers.get('referer'), 'https://discord.com/login');
+    assert.equal(loginCall.headers.get('host'), 'discord.com');
+    assert.equal(loginCall.headers.get('cookie'), '__dcfduid=dcf123; __sdcfduid=sdcf456');
+    assert.equal(loginCall.headers.get('x-super-properties'), 'eyJvcyI6IldpbmRvd3MifQ==');
+
+    // Step 3: MFA / 2FA TOTP challenge using direct Discord path (/api/v9/auth/login -> /api/v9/auth/mfa/totp)
+    const mfaStartResp = await worker.fetch(
+      new Request('https://my.workers.dev/api/v9/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ login: 'mfa@example.com', password: 'secret' }),
+      }),
+      {},
+      {}
+    );
+    assert.equal(mfaStartResp.status, 200);
+    const mfaStartJson = await mfaStartResp.json();
+    assert.equal(mfaStartJson.mfa, true);
+    assert.equal(mfaStartJson.ticket, 'mfa-ticket-999');
+
+    const mfaTotpResp = await worker.fetch(
+      new Request('https://my.workers.dev/api/v9/auth/mfa/totp', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code: '123456', ticket: mfaStartJson.ticket }),
+      }),
+      {},
+      {}
+    );
+    assert.equal(mfaTotpResp.status, 200);
+    const mfaTotpJson = await mfaTotpResp.json();
+    assert.equal(mfaTotpJson.token, 'discord-mfa-final-token');
+
+    // Step 4: Captcha challenge passthrough (400 status & JSON preserved)
+    const captchaResp = await worker.fetch(
+      new Request('https://my.workers.dev/api/v9/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Origin: 'https://my.workers.dev' },
+        body: JSON.stringify({ login: 'captcha@example.com', password: 'secret' }),
+      }),
+      {},
+      {}
+    );
+    assert.equal(captchaResp.status, 400);
+    const captchaJson = await captchaResp.json();
+    assert.deepEqual(captchaJson.captcha_key, ['captcha-required']);
+    assert.equal(captchaResp.headers.get('access-control-allow-origin'), 'https://my.workers.dev');
+
+    // Step 5: Authenticated /users/@me call with Authorization token
+    const meResp = await worker.fetch(
+      new Request('https://my.workers.dev/-----https://discord.com/api/v9/users/@me', {
+        headers: { Authorization: 'discord-session-token-ok' },
+      }),
+      {},
+      {}
+    );
+    assert.equal(meResp.status, 200);
+    const meJson = await meResp.json();
+    assert.equal(meJson.username, 'testuser');
+    assert.equal(capturedCalls[capturedCalls.length - 1].headers.get('authorization'), 'discord-session-token-ok');
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+});
+
+test('Discord Gateway WebSocket, Remote Auth QR WebSocket, Redirects, and Cookie-Free CDN', async () => {
+  const origFetch = globalThis.fetch;
+  const calls = [];
+
+  globalThis.fetch = async (input, init) => {
+    const urlStr = typeof input === 'string' ? input : input.url;
+    const headers = new Headers(init?.headers || {});
+    calls.push({ url: urlStr, headers });
+
+    if (urlStr.startsWith('https://gateway.discord.gg/') || urlStr.startsWith('https://remote-auth-gateway.discord.gg/')) {
+      return new Response('ws-mock-ok', { status: 200 });
+    }
+    if (urlStr === 'https://discord.gg/testinvite') {
+      return new Response(null, {
+        status: 302,
+        headers: { Location: 'https://discord.com/invite/testinvite' },
       });
     }
-    if (String(u).includes('googlevideo.com')) {
-      return new Response(new Uint8Array([1, 2, 3, 4]), {
-        status: 206,
-        headers: { 'Content-Type': 'video/mp4', 'Content-Range': 'bytes 0-3/100', 'Accept-Ranges': 'bytes' },
+    if (urlStr.startsWith('https://cdn.discordapp.com/')) {
+      return new Response(new Uint8Array([137, 80, 78, 71]), {
+        status: 200,
+        headers: { 'Content-Type': 'image/png' },
       });
     }
     return new Response('ok', { status: 200 });
   };
 
   try {
-    const pResp = await worker.fetch(new Request('https://my.workers.dev/yt/api/player?v=dQw4w9WgXcQ'), {}, {});
-    assert.equal(pResp.status, 200);
-    const pData = await pResp.json();
-    assert.equal(pData.status, 'OK');
-    assert.equal(pData.muxed.length, 1);
-    assert.match(pData.muxed[0].url, /^https:\/\/my\.workers\.dev\/-----https:\/\/rr1---sn-a\.googlevideo\.com/);
-
-    const m3u8Resp = await worker.fetch(
-      new Request('https://my.workers.dev/-----https://manifest.googlevideo.com/master.m3u8'),
+    // 1. Gateway WebSocket
+    await worker.fetch(
+      new Request(
+        'https://my.workers.dev/-----wss://gateway.discord.gg/?encoding=json&v=9&compress=zlib-stream&__proxy_origin=https%3A%2F%2Fdiscord.com',
+        { headers: { Upgrade: 'websocket', Connection: 'Upgrade', 'cf-ray': '123' } }
+      ),
       {},
-      { waitUntil() {} }
+      {}
     );
-    assert.equal(m3u8Resp.status, 200);
-    assert.match(await m3u8Resp.text(), /https:\/\/my\.workers\.dev\/-----https:\/\/rr1---sn-a\.googlevideo\.com\/seg1\.ts/);
+    assert.equal(calls[0].url, 'https://gateway.discord.gg/?encoding=json&v=9&compress=zlib-stream');
+    assert.equal(calls[0].headers.get('origin'), 'https://discord.com');
+    assert.equal(calls[0].headers.get('host'), 'gateway.discord.gg');
+    assert.equal(calls[0].headers.get('cf-ray'), null);
 
-    const gvResp = await worker.fetch(
-      new Request('https://my.workers.dev/-----https://rr1---sn-a.googlevideo.com/videoplayback?itag=18', {
-        headers: { Range: 'bytes=0-3' },
+    // 2. Remote Auth QR WebSocket (without explicit __proxy_origin, defaults to https://discord.com)
+    await worker.fetch(
+      new Request('https://my.workers.dev/-----wss://remote-auth-gateway.discord.gg/?v=2', {
+        headers: { Upgrade: 'websocket', Connection: 'Upgrade' },
+      }),
+      {},
+      {}
+    );
+    assert.equal(calls[1].url, 'https://remote-auth-gateway.discord.gg/?v=2');
+    assert.equal(calls[1].headers.get('origin'), 'https://discord.com');
+    assert.equal(calls[1].headers.get('host'), 'remote-auth-gateway.discord.gg');
+
+    // 3. Invite 302 redirect rewriting
+    const redirResp = await worker.fetch(
+      new Request('https://my.workers.dev/-----https://discord.gg/testinvite'),
+      {},
+      {}
+    );
+    assert.equal(redirResp.status, 302);
+    assert.equal(
+      redirResp.headers.get('location'),
+      'https://my.workers.dev/-----https://discord.com/invite/testinvite'
+    );
+
+    // 4. Cookie-free Discord CDN strips Cookie and sets Cache-Control
+    const cdnResp = await worker.fetch(
+      new Request('https://my.workers.dev/-----https://cdn.discordapp.com/avatars/123/abc.png', {
+        headers: { Cookie: '__dcfduid=secret' },
       }),
       {},
       { waitUntil() {} }
     );
-    assert.equal(gvResp.status, 206);
-    assert.equal(lastInit.cf, undefined);
-    assert.equal(lastInit.headers.get('origin'), 'https://www.youtube.com');
-    assert.equal(lastInit.headers.get('referer'), 'https://www.youtube.com/');
-    assert.equal(gvResp.headers.get('access-control-expose-headers'), '*');
+    assert.equal(cdnResp.status, 200);
+    assert.equal(calls[3].headers.get('cookie'), null);
+    assert.match(cdnResp.headers.get('cache-control'), /max-age=86400/);
   } finally {
     globalThis.fetch = origFetch;
   }
 });
 
-test('Official YouTube Data API v3 integration (YT_API_KEY) and parseIsoDuration', async () => {
-  assert.equal(parseIsoDuration('PT3M33S'), '3:33');
-  assert.equal(parseIsoDuration('PT1H2M5S'), '1:02:05');
-  assert.equal(parseIsoDuration('PT45S'), '0:45');
+// ============================================================================
+// 4. Client Runtime & Service Worker Syntax + VM Execution Tests
+// ============================================================================
 
-  const health = await worker.fetch(
-    new Request('https://my.workers.dev/__proxy_health'),
-    { YT_API_KEY: 'test-key', YT_COOKIE: 'SID=1' },
-    {}
+test('SERVICE_WORKER_SCRIPT and CLIENT_RUNTIME_SCRIPT parse cleanly and rewrite Discord browser APIs', () => {
+  // Verify Service Worker script has valid JS syntax
+  assert.doesNotThrow(() => new vm.Script(SERVICE_WORKER_SCRIPT));
+
+  function runInMockBrowser(pathname) {
+    const fetchCalls = [];
+    const wsCalls = [];
+    const xhrCalls = [];
+    const historyCalls = [];
+    const attrCalls = [];
+
+    class MockRequest {
+      constructor(url, init) {
+        this.url = url;
+        this.init = init;
+      }
+    }
+    class MockWebSocket {
+      constructor(url, protocols) {
+        wsCalls.push({ url, protocols });
+      }
+    }
+    MockWebSocket.CONNECTING = 0;
+    MockWebSocket.OPEN = 1;
+    MockWebSocket.CLOSING = 2;
+    MockWebSocket.CLOSED = 3;
+
+    class MockXHR {}
+    MockXHR.prototype.open = function (method, url) {
+      xhrCalls.push({ method, url });
+    };
+
+    class MockHistory {}
+    MockHistory.prototype.pushState = function (state, title, url) {
+      historyCalls.push({ fn: 'pushState', url });
+    };
+    MockHistory.prototype.replaceState = function (state, title, url) {
+      historyCalls.push({ fn: 'replaceState', url });
+    };
+
+    class MockElement {}
+    MockElement.prototype.setAttribute = function (k, v) {
+      attrCalls.push({ k, v });
+    };
+
+    const sandbox = {
+      URL,
+      DOMException,
+      location: {
+        origin: 'https://my.workers.dev',
+        href: `https://my.workers.dev${pathname}`,
+        pathname,
+        search: '',
+        hash: '',
+      },
+      Request: MockRequest,
+      fetch: (u, init) => {
+        fetchCalls.push({ u, init });
+        return Promise.resolve({ ok: true });
+      },
+      WebSocket: MockWebSocket,
+      EventSource: function () {},
+      Worker: function () {},
+      XMLHttpRequest: MockXHR,
+      History: MockHistory,
+      Element: MockElement,
+      HTMLScriptElement: { prototype: {} },
+      HTMLImageElement: { prototype: {} },
+      HTMLLinkElement: { prototype: {} },
+      HTMLAnchorElement: { prototype: {} },
+      HTMLFormElement: { prototype: {} },
+      HTMLIFrameElement: { prototype: {} },
+      HTMLSourceElement: { prototype: {} },
+      HTMLMediaElement: { prototype: {} },
+      navigator: { sendBeacon: () => true },
+    };
+    sandbox.window = sandbox;
+    sandbox.history = new MockHistory();
+
+    vm.runInNewContext(CLIENT_RUNTIME_SCRIPT, sandbox);
+    return { sandbox, fetchCalls, wsCalls, xhrCalls, historyCalls, attrCalls };
+  }
+
+  // Case A: Page loaded via /-----https://discord.com/login
+  const a = runInMockBrowser('/-----https://discord.com/login');
+  a.sandbox.fetch('/api/v9/auth/login', { method: 'POST' });
+  assert.equal(a.fetchCalls[0].u, 'https://my.workers.dev/-----https://discord.com/api/v9/auth/login');
+
+  new a.sandbox.WebSocket('wss://gateway.discord.gg/?encoding=json&v=9');
+  assert.equal(
+    a.wsCalls[0].url,
+    'wss://my.workers.dev/-----wss://gateway.discord.gg/?encoding=json&v=9&__proxy_origin=https%3A%2F%2Fdiscord.com'
   );
-  const hJson = await health.json();
-  assert.equal(hJson.ytApiKeyConfigured, true);
-  assert.equal(hJson.ytCookieConfigured, true);
 
-  const origFetch = globalThis.fetch;
-  globalThis.fetch = async (u) => {
-    const s = String(u);
-    if (s.includes('googleapis.com/youtube/v3/search')) {
-      return new Response(
-        JSON.stringify({
-          items: [
-            {
-              id: { videoId: 'dQw4w9WgXcQ' },
-              snippet: { title: 'Official API Result', channelTitle: 'Rick Astley', publishedAt: '2009-10-25T00:00:00Z' },
-            },
-          ],
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-    if (s.includes('googleapis.com/youtube/v3/videos')) {
-      return new Response(
-        JSON.stringify({
-          items: [
-            {
-              id: 'dQw4w9WgXcQ',
-              contentDetails: { duration: 'PT3M33S' },
-              statistics: { viewCount: '1500000000' },
-            },
-          ],
-        }),
-        { status: 200, headers: { 'Content-Type': 'application/json' } }
-      );
-    }
-    return new Response('{}', { status: 404 });
-  };
+  const xhr = new a.sandbox.XMLHttpRequest();
+  xhr.open('POST', '//discord.com/api/v9/auth/mfa/totp');
+  assert.equal(xhrCallsCheck(a.xhrCalls[0].url), 'https://my.workers.dev/-----https://discord.com/api/v9/auth/mfa/totp');
 
-  try {
-    const resp = await worker.fetch(
-      new Request('https://my.workers.dev/yt/api/search?q=rick'),
-      { YT_API_KEY: 'test-key' },
-      {}
-    );
-    assert.equal(resp.status, 200);
-    const data = await resp.json();
-    assert.equal(data.videos.length, 1);
-    assert.equal(data.videos[0].id, 'dQw4w9WgXcQ');
-    assert.equal(data.videos[0].title, 'Official API Result');
-    assert.equal(data.videos[0].length, '3:33');
-  } finally {
-    globalThis.fetch = origFetch;
-  }
+  a.sandbox.history.pushState(null, '', '/channels/@me');
+  assert.equal(a.historyCalls[0].url, '/-----https://discord.com/channels/@me');
+
+  const el = new a.sandbox.Element();
+  el.setAttribute('src', '/assets/app.js');
+  el.setAttribute('integrity', 'sha256-deadbeef');
+  assert.equal(a.attrCalls.length, 1);
+  assert.equal(a.attrCalls[0].v, 'https://my.workers.dev/-----https://discord.com/assets/app.js');
+
+  // Case B: Page loaded via direct /login path on proxy origin
+  const b = runInMockBrowser('/login');
+  b.sandbox.fetch('/api/v9/auth/login', { method: 'POST' });
+  assert.equal(b.fetchCalls[0].u, 'https://my.workers.dev/-----https://discord.com/api/v9/auth/login');
 });
+
+function xhrCallsCheck(u) {
+  return u;
+}

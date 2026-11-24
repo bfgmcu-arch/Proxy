@@ -1,13 +1,19 @@
-# Cloudflare Workers Web Proxy + Built-in YouTube Player
+# Cloudflare Workers Discord Proxy
 
-A **100% Cloudflare Workers** proxy (single self-contained file: `src/index.js`, zero external dependencies) optimized for the **Cloudflare Workers Free Tier** (10ms CPU / 128MB RAM / 100k req/day).
+A **100% Cloudflare Workers** proxy (single self-contained file: `src/index.js`, zero external dependencies) specifically built for **Discord** and optimized for the **Cloudflare Workers Free Tier** (10ms CPU / 128MB RAM / 100k req/day).
 
 ## Features
 
-- **Built-in Fast YouTube Player (`/yt`)**: Uses YouTube's InnerTube API (`IOS` → `ANDROID` → `TVHTML5_SIMPLY_EMBEDDED_PLAYER` fallback chain) to search, browse, and play YouTube videos directly in a native HTML5 `<video>` player with quality switching, HLS `.m3u8` manifest rewriting, related videos, and zero-copy `googlevideo.com` `Range`/`206` streaming (no broken Polymer SPA!).
-- **All Websites Proxy (`/-----https://...`)**: Proxies any `http://`, `https://`, `ws://`, or `wss://` website (including Chess.com live games via native WebSocket passthrough).
-- **jsproxy Service Worker (`/__proxy_sw.js`)**: Intercepts `fetch`, `XHR`, ES `import()`, dynamic scripts, and media right in the browser for zero extra Worker CPU.
-- **Cloudflare Free-Tier Optimized**: Native Rust streaming `HTMLRewriter`, immutable browser-cached client runtime (`/__proxy_runtime.js`), edge + browser static asset caching (`ytimg.com`, `ggpht.com`, `chesscomfiles.com`, `fonts.gstatic.com`), and zero-copy streaming for video/binary assets.
+- **Discord-First Launcher (`/`)**: One-click **Sign In to Discord** (`/login`), **Open Discord App** (`/app`), **Direct Messages** (`/channels/@me`), **Discord PTB**, **Discord Canary**, and custom Discord invite/channel URLs.
+- **Full Discord Sign-In Support**:
+  - Proxies `discord.com/login`, `/api/v9/auth/login`, `/api/v9/auth/mfa/totp` (2FA), and `/api/v9/users/@me`.
+  - Rewrites `Set-Cookie` headers (`__dcfduid`, `__sdcfduid`, `__cf_bm`) for both HTTPS (`SameSite=None; Secure`) and local HTTP (`SameSite=Lax`) proxies.
+  - Enforces Discord `Origin` (`https://discord.com` / `ptb.discord.com` / `canary.discord.com`) and `Referer` headers while stripping `cf-*` and `sec-fetch-*` headers.
+  - Supports CORS preflight with Discord auth/captcha headers (`Authorization`, `X-Super-Properties`, `X-Captcha-Key`, etc.).
+- **Gateway & Remote Auth WebSockets**: Native WebSocket passthrough for `wss://gateway.discord.gg` and `wss://remote-auth-gateway.discord.gg` (QR code sign-in).
+- **Direct Discord Path Resolution**: Requests to `/login`, `/app`, `/channels/*`, `/api/*`, `/assets/*`, `/invite/*`, etc. resolve automatically to `https://discord.com`.
+- **Service Worker & Client Runtime (`/__proxy_sw.js`, `/__proxy_runtime.js`)**: Intercepts `fetch`, `XHR`, `WebSocket`, `Worker`, `History.pushState`/`replaceState`, and DOM URL attributes in the browser.
+- **Cookie-Free Discord CDN Caching**: Strips cookies and caches static assets from `cdn.discordapp.com`, `media.discordapp.net`, `images-ext-1.discordapp.net`, and `images-ext-2.discordapp.net`.
 
 ## Deploy to Cloudflare Workers
 
@@ -22,27 +28,6 @@ npx wrangler deploy
 
 **Option 3 — Cloudflare Workers Git Integration**
 Connect this GitHub repository in Cloudflare Dashboard → **Workers & Pages** → **Create** → **Import a repository** (uses `wrangler.toml` automatically).
-
-## Usage
-
-- Open your Worker URL (`https://web-proxy.<your-subdomain>.workers.dev`).
-- Click **▶ YouTube** (`/yt`) or **⚡ Shorts** (`/shorts`) to browse, search, and watch videos directly.
-- Any `youtube.com`, `youtu.be`, `youtube.com/shorts/...`, or `youtube.com/embed/...` link automatically opens in the working player.
-- Toggle between **Direct Proxy Stream** and **Official YT Player** right in the watch bar.
-
-## Optional: Official YouTube Data API v3 & Signed-In Session
-
-For the highest reliability without anonymous datacenter rate limits, you can configure optional Cloudflare Worker secrets (never committed to git):
-
-```bash
-# Official YouTube Data API v3 key (for reliable search, home feed, Shorts feed, and metadata)
-npx wrangler secret put YT_API_KEY
-
-# Optional: Your own signed-in YouTube session cookie (authenticates InnerTube as your account)
-npx wrangler secret put YT_COOKIE
-```
-
-Check `/__proxy_health` to confirm `ytApiKeyConfigured` and `ytCookieConfigured` are `true`.
 
 ## Test
 

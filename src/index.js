@@ -36,7 +36,7 @@ const DISCORD_EXACT_HOSTS = new Set([
 ]);
 
 const DISCORD_APP_PATH_RE =
-  /^\/(?:login|register|app|channels(?:\/|$)|invite(?:\/|$)|oauth2(?:\/|$)|api(?:\/|$)|assets(?:\/|$)|verify(?:\/|$)|reset(?:\/|$)|handoff(?:\/|$)|activate(?:\/|$)|billing(?:\/|$)|store(?:\/|$)|nitro(?:\/|$)|shop(?:\/|$)|quests(?:\/|$)|discovery(?:\/|$)|servers(?:\/|$)|developers(?:\/|$)|me(?:\/|$)|guild-stages(?:\/|$)|events(?:\/|$))/i;
+  /^\/(?:login|register|app|channels(?:\/|$)|invite(?:\/|$)|oauth2(?:\/|$)|api(?:\/|$)|assets(?:\/|$)|verify(?:\/|$)|reset(?:\/|$)|handoff(?:\/|$)|activate(?:\/|$)|billing(?:\/|$)|store(?:\/|$)|nitro(?:\/|$)|shop(?:\/|$)|quests(?:\/|$)|discovery(?:\/|$)|servers(?:\/|$)|developers(?:\/|$)|me(?:\/|$)|guild-stages(?:\/|$)|events(?:\/|$)|cdn-cgi(?:\/|$))/i;
 
 const DISCORD_CORS_ALLOW_HEADERS =
   'Authorization, Content-Type, X-Super-Properties, X-Discord-Locale, X-Discord-Timezone, X-Debug-Options, X-Context-Properties, X-Fingerprint, X-Captcha-Key, X-Captcha-Rqtoken, X-Captcha-Session-Id, X-Audit-Log-Reason, If-None-Match';
@@ -463,7 +463,7 @@ if(oES){var PES=function(u,c){var n=rwHttp(u);return arguments.length>1?new oES(
 var oW=window.Worker;
 if(oW){var PW=function(u,o){var n=rwHttp(u);return arguments.length>1?new oW(n,o):new oW(n);};PW.prototype=oW.prototype;window.Worker=PW;}
 if(navigator&&navigator.sendBeacon){var oB=navigator.sendBeacon.bind(navigator);navigator.sendBeacon=function(u,d){return oB(rwHttp(u),d);};}
-function wH(fn){var o=History.prototype[fn];if(!o)return;History.prototype[fn]=function(s,t,u){if(u!==undefined&&u!==null&&u!==''){try{var n=rwHttp(String(u));if(n&&n.indexOf(P)===0)u=n.substring(P.length);}catch(e){}}return o.call(this,s,t,u);};}
+function wH(fn){var o=History.prototype[fn];if(!o)return;History.prototype[fn]=function(s,t,u){if(u!==undefined&&u!==null&&u!==''){try{var n=rwHttp(String(u));if(n&&n.indexOf(P)===0){var sub=n.substring(P.length);if(sub.indexOf(PRE+D_ORIGIN+'/')===0){u=sub.substring((PRE+D_ORIGIN).length)||'/';}else{u=sub;}}}catch(e){}}return o.call(this,s,t,u);};}
 wH('pushState');wH('replaceState');
 var oOp=window.open;if(oOp){window.open=function(u,t,f){if(u)u=rwHttp(String(u));return oOp.call(this,u,t,f);};}
 var UA={src:1,href:1,action:1,poster:1,data:1},oSA=Element.prototype.setAttribute;
@@ -555,7 +555,16 @@ function streamRewriteHtml(response, baseUrl, proxyBase) {
 }
 
 function renderSwBootstrapPage(targetUrl) {
-  const safeTarget = JSON.stringify(PREFIX + targetUrl);
+  let destPath = PREFIX + targetUrl;
+  try {
+    const parsed = new URL(targetUrl);
+    if (parsed.origin === DISCORD_ORIGIN && isDiscordAppPath(parsed.pathname)) {
+      destPath = parsed.pathname + parsed.search + parsed.hash;
+    }
+  } catch {
+    // ignore
+  }
+  const safeTarget = JSON.stringify(destPath);
   return new Response(
     `<!DOCTYPE html>
 <html lang="en">
@@ -620,15 +629,15 @@ function renderDiscordLauncher() {
     <h1>Discord Proxy <span class="badge">CF WORKERS</span></h1>
     <p>Dedicated Discord proxy with full sign-in, 2FA, QR remote auth, WebSocket Gateway, and CDN media support.</p>
     <div class="primary-actions">
-      <a class="btn btn-primary" data-url="https://discord.com/login" href="/__proxy_go?url=https%3A%2F%2Fdiscord.com%2Flogin">Sign In to Discord</a>
-      <a class="btn btn-secondary" data-url="https://discord.com/app" href="/__proxy_go?url=https%3A%2F%2Fdiscord.com%2Fapp">Open Discord App</a>
+      <a class="btn btn-primary" data-url="https://discord.com/login" href="/login">Sign In to Discord</a>
+      <a class="btn btn-secondary" data-url="https://discord.com/app" href="/app">Open Discord App</a>
     </div>
     <form action="/" method="GET" id="proxy-form">
       <input type="text" name="url" placeholder="Paste Discord invite, channel URL, or discord.com path…" required>
       <button class="btn btn-primary" type="submit">Go</button>
     </form>
     <div class="quick">
-      <a class="btn btn-secondary" data-url="https://discord.com/channels/@me" href="/__proxy_go?url=https%3A%2F%2Fdiscord.com%2Fchannels%2F%40me">Direct Messages</a>
+      <a class="btn btn-secondary" data-url="https://discord.com/channels/@me" href="/channels/@me">Direct Messages</a>
       <a class="btn btn-secondary" data-url="https://ptb.discord.com/login" href="/__proxy_go?url=https%3A%2F%2Fptb.discord.com%2Flogin">Discord PTB</a>
       <a class="btn btn-secondary" data-url="https://canary.discord.com/login" href="/__proxy_go?url=https%3A%2F%2Fcanary.discord.com%2Flogin">Discord Canary</a>
     </div>
@@ -637,6 +646,7 @@ function renderDiscordLauncher() {
       <span class="muted">Gateway WSS + Auth Ready</span>
     </div>
     <script>
+      var DISCORD_PATH_RE = ${DISCORD_APP_PATH_RE.toString()};
       var swReady = (async function () {
         var el = document.getElementById('sw-status');
         try {
@@ -654,6 +664,13 @@ function renderDiscordLauncher() {
         if (val.charAt(0) === '/') val = 'https://discord.com' + val;
         else if (!/^https?:\\/\\//i.test(val)) val = 'https://' + val;
         await swReady;
+        try {
+          var u = new URL(val);
+          if (u.origin === 'https://discord.com' && DISCORD_PATH_RE.test(u.pathname)) {
+            window.location.href = u.pathname + u.search + u.hash;
+            return;
+          }
+        } catch (e) {}
         window.location.href = '${PREFIX}' + val;
       }
 

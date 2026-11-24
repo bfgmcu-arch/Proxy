@@ -245,7 +245,15 @@ test('Worker serves Discord launcher, health check, SW, runtime, and bootstrap p
     {}
   );
   assert.equal(go.status, 200);
-  assert.match(await go.text(), /https:\/\/discord\.com\/login/);
+  assert.match(await go.text(), /var dest = "\/login";/);
+
+  const goPtb = await worker.fetch(
+    new Request('https://my.workers.dev/__proxy_go?url=ptb.discord.com/login'),
+    {},
+    {}
+  );
+  assert.equal(goPtb.status, 200);
+  assert.match(await goPtb.text(), /\/-----https:\/\/ptb\.discord\.com\/login/);
 });
 
 test('Worker enforces ALLOWED_IPS and handles CORS preflight with Discord headers', async () => {
@@ -659,7 +667,7 @@ test('SERVICE_WORKER_SCRIPT and CLIENT_RUNTIME_SCRIPT parse cleanly and rewrite 
   assert.equal(xhrCallsCheck(a.xhrCalls[0].url), 'https://my.workers.dev/-----https://discord.com/api/v9/auth/mfa/totp');
 
   a.sandbox.history.pushState(null, '', '/channels/@me');
-  assert.equal(a.historyCalls[0].url, '/-----https://discord.com/channels/@me');
+  assert.equal(a.historyCalls[0].url, '/channels/@me');
 
   const el = new a.sandbox.Element();
   el.setAttribute('src', '/assets/app.js');
@@ -671,6 +679,13 @@ test('SERVICE_WORKER_SCRIPT and CLIENT_RUNTIME_SCRIPT parse cleanly and rewrite 
   const b = runInMockBrowser('/login');
   b.sandbox.fetch('/api/v9/auth/login', { method: 'POST' });
   assert.equal(b.fetchCalls[0].u, 'https://my.workers.dev/-----https://discord.com/api/v9/auth/login');
+  b.sandbox.history.pushState(null, '', '/channels/@me');
+  assert.equal(b.historyCalls[0].url, '/channels/@me');
+
+  // Case C: Non-primary Discord host (ptb.discord.com) retains /----- prefix in pushState
+  const c = runInMockBrowser('/-----https://ptb.discord.com/login');
+  c.sandbox.history.pushState(null, '', '/channels/@me');
+  assert.equal(c.historyCalls[0].url, '/-----https://ptb.discord.com/channels/@me');
 });
 
 function xhrCallsCheck(u) {

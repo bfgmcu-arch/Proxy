@@ -381,6 +381,7 @@ self.addEventListener('fetch', (event) => {
     const init = {
       method: req.method,
       headers: new Headers(req.headers),
+      mode: req.mode === 'navigate' ? 'same-origin' : req.mode,
       credentials: 'include',
       redirect: 'follow',
     };
@@ -871,6 +872,10 @@ export default {
       response = await fetch(fetchUrl.href, fetchInit);
     } catch (e) {
       return new Response('Error fetching target URL: ' + e.message, { status: 502 });
+    }
+
+    if (isDiscord && fetchUrl.pathname.startsWith('/assets/') && response.status === 400) {
+      return Response.redirect(fetchUrl.href, 302);
     }
 
     const responseHeaders = new Headers(response.headers);

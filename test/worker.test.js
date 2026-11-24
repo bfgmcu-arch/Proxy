@@ -504,6 +504,9 @@ test('Discord Gateway WebSocket, Remote Auth QR WebSocket, Redirects, and Cookie
         headers: { Location: 'https://discord.com/invite/testinvite' },
       });
     }
+    if (urlStr === 'https://discord.com/assets/bad-worker-origin.js') {
+      return new Response('Bad Worker Origin', { status: 400 });
+    }
     if (urlStr.startsWith('https://cdn.discordapp.com/')) {
       return new Response(new Uint8Array([137, 80, 78, 71]), {
         status: 200,
@@ -564,6 +567,18 @@ test('Discord Gateway WebSocket, Remote Auth QR WebSocket, Redirects, and Cookie
     assert.equal(calls[3].headers.get('cookie'), null);
     assert.equal(calls[3].cf, undefined);
     assert.match(cdnResp.headers.get('cache-control'), /max-age=86400/);
+
+    // 5. Discord /assets/* 400 Bad Worker Origin falls back to 302 redirect
+    const assetFallbackResp = await worker.fetch(
+      new Request('https://my.workers.dev/-----https://discord.com/assets/bad-worker-origin.js'),
+      {},
+      {}
+    );
+    assert.equal(assetFallbackResp.status, 302);
+    assert.equal(
+      assetFallbackResp.headers.get('location'),
+      'https://discord.com/assets/bad-worker-origin.js'
+    );
   } finally {
     globalThis.fetch = origFetch;
   }
